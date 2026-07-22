@@ -1,0 +1,21 @@
+# C++ worker
+worker/build/
+# Vendored tree-sitter grammars (cloned repos; see README "Setup")
+worker/third_party/
+
+# Python
+ai-layer/venv/
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+.next/
+
+# Go
+gateway/gateway
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
