@@ -1,7 +1,16 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
 # C++ worker
 worker/build/
 # Vendored tree-sitter grammars (cloned repos; see README "Setup")
 worker/third_party/
+
+# Scan output
+*.sarif
+sentinel-report.*
 
 # Python
 ai-layer/venv/

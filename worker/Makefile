@@ -4,7 +4,7 @@ CC       ?= cc
 TS_DIR   := third_party
 TS_INC   := -I$(TS_DIR)/tree-sitter/lib/include
 
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2
+CXXFLAGS ?= -std=c++23 -Wall -Wextra -Wpedantic -O2
 CXXFLAGS += $(TS_INC)
 # Vendored C is third-party; don't police its warnings.
 TSCFLAGS := -O2 -w $(TS_INC)
@@ -42,10 +42,16 @@ build/ts/$(subst /,_,$(basename $(1))).o: $(1) | build/ts
 endef
 $(foreach s,$(TS_SRCS),$(eval $(call TS_COMPILE_RULE,$(s))))
 
-# Analyzer tests need the grammars but not RabbitMQ/curl.
+# Every source except main.cpp and triage_client.cpp, which pull in RabbitMQ and
+# curl. Keeping the analysis core free of I/O dependencies is what lets the test
+# suite run with no broker and no database.
+ENGINE_SRC := src/analyzer.cpp src/languages.cpp src/ast.cpp src/taint.cpp \
+              src/types.cpp src/sanitizers.cpp src/interproc.cpp src/secrets.cpp \
+              src/suppress.cpp src/severity.cpp src/vulnerability.cpp src/sarif.cpp
+
 test: $(TS_OBJS) | build
 	$(CXX) $(CXXFLAGS) -o build/test_analyzer tests/test_analyzer.cpp \
-	    src/analyzer.cpp src/languages.cpp $(TS_OBJS)
+	    $(ENGINE_SRC) $(TS_OBJS)
 	./build/test_analyzer
 
 build build/ts:

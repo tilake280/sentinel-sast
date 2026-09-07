@@ -1,19 +1,44 @@
-version: '3.8'
+# Local development infrastructure.
+#
+# Credentials come from a .env file that is NOT committed. Copy .env.example to
+# .env to get the local defaults. The `:-` fallbacks keep `docker compose up`
+# working with no .env at all, which is what makes a fresh clone runnable --
+# but they are development values and must not survive into a deployment.
 services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_USER: sentinel
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: sentinel_db
+      POSTGRES_USER: ${POSTGRES_USER:-sentinel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-sentinel_db}
     ports:
-      - '5432:5432'
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-sentinel} -d ${POSTGRES_DB:-sentinel_db}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   redis:
     image: redis:alpine
     ports:
-      - '6379:6379'
+      - '${REDIS_PORT:-6379}:6379'
+
   rabbitmq:
     image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
     ports:
-      - '5672:5672'
-      - '15672:15672'
+      - '${RABBITMQ_PORT:-5672}:5672'
+      - '${RABBITMQ_MANAGEMENT_PORT:-15672}:15672'
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
