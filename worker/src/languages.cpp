@@ -46,6 +46,7 @@ LanguageSpec make_javascript() {
     s.function_body_field = "body";
 
     s.return_node_types = {"return_statement"};
+    s.block_node_types = {"statement_block"};
     s.comment_node_types = {"comment"};
     s.import_node_types = {"import_statement", "lexical_declaration", "variable_declaration"};
     s.pair_node_types = {"pair"};
@@ -71,9 +72,9 @@ LanguageSpec make_javascript() {
         {"ctx.request.body", "a Koa request body", {}},
         {"event.body", "a Lambda event body", {}},
         {"event.queryStringParameters", "a Lambda query parameter", {}},
-        {"process.argv", "a command-line argument", {}},
-        {"process.env", "an environment variable", {VulnClass::CommandInjection,
-                                                     VulnClass::PathTraversal}},
+        {"process.argv", "a command-line argument", {}, /*local=*/true},
+        {"process.env", "an environment variable",
+         {VulnClass::CommandInjection, VulnClass::PathTraversal}, /*local=*/true},
         {"location.search", "the browser URL query string", {}},
         {"location.hash", "the browser URL fragment", {}},
         {"location.href", "the browser URL", {}},
@@ -88,6 +89,10 @@ LanguageSpec make_javascript() {
         {"file.originalname", "an uploaded file's declared name",
          {VulnClass::PathTraversal, VulnClass::CommandInjection}},
         {"req.file", "an uploaded file", {VulnClass::PathTraversal}},
+        {"req.files", "uploaded files", {VulnClass::PathTraversal}},
+        {"ctx.querystring", "the raw Koa query string", {}},
+        {"ctx.params", "a Koa path parameter", {}},
+        {"ctx.request.query", "a Koa query parameter", {}},
     };
 
     // ---- Call sinks -------------------------------------------------------
@@ -189,18 +194,19 @@ LanguageSpec make_javascript() {
         {"unserialize", VulnClass::InsecureDeserialization, ReceiverType::Unknown,
          ReceiverType::Unknown, -1, false, ""},
         {"load", VulnClass::InsecureDeserialization, ReceiverType::Serializer,
-         ReceiverType::Unknown, -1, false, "js-yaml load() can construct arbitrary types"},
+         ReceiverType::Unknown, -1, false, "js-yaml load() can construct arbitrary types",
+         /*strict_receiver=*/true},
 
         // NoSQL. A tainted object reaching a Mongo filter allows operator
         // injection such as {"$ne": null}.
         {"find", VulnClass::NoSqlInjection, ReceiverType::MongoCollection,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::Unknown, 0, false, "", false, -1, "where"},
         {"findOne", VulnClass::NoSqlInjection, ReceiverType::MongoCollection,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::Unknown, 0, false, "", false, -1, "where"},
         {"deleteOne", VulnClass::NoSqlInjection, ReceiverType::MongoCollection,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::Unknown, 0, false, "", false, -1, "where"},
         {"updateOne", VulnClass::NoSqlInjection, ReceiverType::MongoCollection,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::Unknown, 0, false, "", false, -1, "where"},
 
         // Log injection.
         {"log", VulnClass::LogInjection, ReceiverType::Logger,
@@ -240,7 +246,8 @@ LanguageSpec make_javascript() {
         {"createCipher(", VulnClass::WeakCryptography, Severity::High,
          "createCipher derives a key with a broken KDF; use createCipheriv"},
         {"Math.random()", VulnClass::WeakCryptography, Severity::Low,
-         "Math.random is not cryptographically secure; use crypto.randomBytes"},
+         "Math.random is not cryptographically secure; use crypto.randomBytes",
+         /*needs_security_context=*/true},
         {"rejectUnauthorized: false", VulnClass::WeakCryptography, Severity::High,
          "TLS certificate verification is disabled"},
         {"NODE_TLS_REJECT_UNAUTHORIZED", VulnClass::WeakCryptography, Severity::High,
@@ -303,6 +310,14 @@ LanguageSpec make_javascript() {
         {"sanitizeHtml", {VulnClass::CrossSiteScripting}, "run through sanitize-html", false},
         {"DOMPurify.sanitize", {VulnClass::CrossSiteScripting}, "sanitised by DOMPurify", false},
         {"he.encode", {VulnClass::CrossSiteScripting}, "HTML-entity encoded", false},
+        {"he.escape", {VulnClass::CrossSiteScripting}, "HTML-entity encoded", false},
+        // Matched by full dotted name only. A bare `escape` is not listed: in
+        // JavaScript that is the deprecated percent-encoding global, and what a
+        // user-defined `escape` does is anyone's guess.
+        {"_.escape", {VulnClass::CrossSiteScripting}, "HTML-escaped by lodash", false},
+        {"lodash.escape", {VulnClass::CrossSiteScripting}, "HTML-escaped by lodash", false},
+        {"validator.escape", {VulnClass::CrossSiteScripting}, "HTML-escaped by validator",
+         false},
         {"encodeURIComponent",
          {VulnClass::CrossSiteScripting, VulnClass::OpenRedirect,
           VulnClass::ServerSideRequestForgery},
@@ -320,6 +335,11 @@ LanguageSpec make_javascript() {
         // SQL identifier escaping.
         {"escapeId", {VulnClass::SqlInjection}, "escaped as a SQL identifier", false},
         {"mysql.escape", {VulnClass::SqlInjection}, "escaped by the MySQL driver", false},
+        {"connection.escape", {VulnClass::SqlInjection}, "escaped by the MySQL driver", false},
+        {"pool.escape", {VulnClass::SqlInjection}, "escaped by the MySQL driver", false},
+        {"db.escape", {VulnClass::SqlInjection}, "escaped by the database driver", false},
+        {"sqlstring.escape", {VulnClass::SqlInjection}, "escaped by sqlstring", false},
+        {"SqlString.escape", {VulnClass::SqlInjection}, "escaped by sqlstring", false},
 
         // A UUID or enum lookup constrains the value to a known set.
         {"validateUUID", {}, "constrained to a UUID", true},
@@ -371,6 +391,7 @@ LanguageSpec make_python() {
     s.function_body_field = "body";
 
     s.return_node_types = {"return_statement"};
+    s.block_node_types = {"block"};
     s.comment_node_types = {"comment"};
     s.import_node_types = {"import_statement", "import_from_statement", "aliased_import"};
     s.pair_node_types = {"pair"};
@@ -394,10 +415,10 @@ LanguageSpec make_python() {
         {"request.query_params", "a DRF query parameter", {}},
         {"self.get_argument", "a Tornado request argument", {}},
         {"flask.request", "a Flask request object", {}},
-        {"sys.argv", "a command-line argument", {}},
-        {"input(", "interactive input", {}},
+        {"sys.argv", "a command-line argument", {}, /*local=*/true},
+        {"input(", "interactive input", {}, /*local=*/true},
         {"os.environ", "an environment variable",
-         {VulnClass::CommandInjection, VulnClass::PathTraversal}},
+         {VulnClass::CommandInjection, VulnClass::PathTraversal}, /*local=*/true},
         {"event['body']", "a Lambda event body", {}},
         {"event.get('body')", "a Lambda event body", {}},
     };
@@ -456,8 +477,12 @@ LanguageSpec make_python() {
         // Requires an object-constructing serializer. json.loads is a
         // DataCodec, so it resolves to a known non-matching receiver and the
         // rule is skipped rather than firing on every JSON parse.
+        // Strict: `loads` is what every serializer calls it, and most are
+        // not pickle. itsdangerous verifies a signature and yields JSON;
+        // reporting `s.loads(cookie)` there as CWE-502 is simply wrong. The
+        // dangerous modules are matched by type here and by full name below.
         {"loads", VulnClass::InsecureDeserialization, ReceiverType::Serializer,
-         ReceiverType::DataCodec, -1, false, ""},
+         ReceiverType::DataCodec, -1, false, "", /*strict_receiver=*/true},
         {"pickle.loads", VulnClass::InsecureDeserialization, ReceiverType::Unknown,
          ReceiverType::Unknown, -1, true, "pickle can instantiate arbitrary objects"},
         {"pickle.load", VulnClass::InsecureDeserialization, ReceiverType::Unknown,
@@ -489,9 +514,9 @@ LanguageSpec make_python() {
          ReceiverType::Unknown, 0, false, "Markup() marks a string as trusted HTML"},
 
         {"find", VulnClass::NoSqlInjection, ReceiverType::MongoCollection,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::Unknown, 0, false, "", false, -1, "where"},
         {"find_one", VulnClass::NoSqlInjection, ReceiverType::MongoCollection,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::Unknown, 0, false, "", false, -1, "where"},
 
         {"xpath", VulnClass::XPathInjection, ReceiverType::Unknown,
          ReceiverType::Unknown, 0, false, ""},
@@ -522,7 +547,8 @@ LanguageSpec make_python() {
         {"verify=False", VulnClass::WeakCryptography, Severity::High,
          "requests is configured to skip TLS certificate verification"},
         {"random.random()", VulnClass::WeakCryptography, Severity::Low,
-         "random is not cryptographically secure; use the secrets module"},
+         "random is not cryptographically secure; use the secrets module",
+         /*needs_security_context=*/true},
         {"shell=True", VulnClass::CommandInjection, Severity::Medium,
          "shell=True routes the command through a shell interpreter"},
     };
@@ -634,12 +660,14 @@ LanguageSpec make_go() {
     s.function_body_field = "body";
 
     s.return_node_types = {"return_statement"};
+    s.block_node_types = {"block"};
     s.comment_node_types = {"comment"};
     s.import_node_types = {"import_declaration", "import_spec"};
     s.pair_node_types = {"keyed_element", "literal_element"};
     s.concatenation_node_types = {"binary_expression"};
     s.conditional_node_types = {"if_statement", "expression_switch_statement"};
     s.subscript_node_types = {"index_expression"};
+    s.typed_parameter_forms = {{"parameter_declaration", "name", "type"}};
 
     // r.URL.Query() reads as a SQL sink by its last segment, so the analyzer
     // checks sources before sinks. These entries are what make that work.
@@ -663,24 +691,39 @@ LanguageSpec make_go() {
         {"c.Query", "a gin query parameter", {}},
         {"c.PostForm", "a gin form field", {}},
         {"chi.URLParam", "a chi path parameter", {}},
-        {"os.Args", "a command-line argument", {}},
+        {"os.Args", "a command-line argument", {}, /*local=*/true},
         {"os.Getenv", "an environment variable",
-         {VulnClass::CommandInjection, VulnClass::PathTraversal}},
+         {VulnClass::CommandInjection, VulnClass::PathTraversal}, /*local=*/true},
+
+        // Spelled out because sources match whole name segments: `c.Param`
+        // does not cover `c.Params`, nor `r.Cookie` `r.Cookies`.
+        {"c.Params", "gin path parameters", {}},
+        {"c.DefaultQuery", "a gin query parameter", {}},
+        {"c.GetQuery", "a gin query parameter", {}},
+        {"c.QueryArray", "a gin query parameter", {}},
+        {"c.DefaultPostForm", "a gin form field", {}},
+        {"c.GetHeader", "an HTTP request header", {}},
+        {"r.Cookies", "the request's cookies", {}},
+        {"r.URL.RawQuery", "the raw query string", {}},
+        {"r.RequestURI", "the raw request URI", {}},
     };
 
     s.call_sinks = {
+        // On a prepared statement these take the bound parameters, not SQL:
+        // `stmt.QueryRow(username)` is the safe form, so that receiver is
+        // excluded. The statement text went to Prepare, which is still a sink.
         {"Query", VulnClass::SqlInjection, ReceiverType::Unknown,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::PreparedStatement, 0, false, ""},
         {"QueryRow", VulnClass::SqlInjection, ReceiverType::Unknown,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::PreparedStatement, 0, false, ""},
         {"QueryContext", VulnClass::SqlInjection, ReceiverType::Unknown,
-         ReceiverType::Unknown, 1, false, ""},
+         ReceiverType::PreparedStatement, 1, false, ""},
         {"QueryRowContext", VulnClass::SqlInjection, ReceiverType::Unknown,
-         ReceiverType::Unknown, 1, false, ""},
+         ReceiverType::PreparedStatement, 1, false, ""},
         {"Exec", VulnClass::SqlInjection, ReceiverType::Unknown,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::PreparedStatement, 0, false, ""},
         {"ExecContext", VulnClass::SqlInjection, ReceiverType::Unknown,
-         ReceiverType::Unknown, 1, false, ""},
+         ReceiverType::PreparedStatement, 1, false, ""},
         {"Prepare", VulnClass::SqlInjection, ReceiverType::Unknown,
          ReceiverType::Unknown, 0, false, ""},
         {"Raw", VulnClass::SqlInjection, ReceiverType::Database,
@@ -718,10 +761,25 @@ LanguageSpec make_go() {
          ReceiverType::Unknown, -1, false, ""},
         {"JS", VulnClass::CrossSiteScripting, ReceiverType::Unknown,
          ReceiverType::Unknown, -1, false, ""},
+        // Writing to a response is only an HTML sink when the writer really is
+        // the response. Every hash, file, buffer and socket in Go has a Write
+        // method, and Fprintf is how programs print to stderr, so these are
+        // strict: the writer's type has to resolve, which for a handler it
+        // does, from the `w http.ResponseWriter` parameter.
         {"Write", VulnClass::CrossSiteScripting, ReceiverType::HttpResponse,
-         ReceiverType::Unknown, -1, false, ""},
-        {"Fprintf", VulnClass::CrossSiteScripting, ReceiverType::Unknown,
-         ReceiverType::Unknown, 1, false, ""},
+         ReceiverType::Unknown, -1, false, "", /*strict_receiver=*/true},
+        {"WriteString", VulnClass::CrossSiteScripting, ReceiverType::HttpResponse,
+         ReceiverType::Unknown, -1, false, "", /*strict_receiver=*/true},
+        // The writer is argument 0 here, and any later argument can carry the
+        // payload -- the format string or the values interpolated into it.
+        {"Fprintf", VulnClass::CrossSiteScripting, ReceiverType::HttpResponse,
+         ReceiverType::Unknown, -1, false, "", /*strict_receiver=*/true, /*typed_argument=*/0},
+        {"Fprint", VulnClass::CrossSiteScripting, ReceiverType::HttpResponse,
+         ReceiverType::Unknown, -1, false, "", /*strict_receiver=*/true, /*typed_argument=*/0},
+        {"Fprintln", VulnClass::CrossSiteScripting, ReceiverType::HttpResponse,
+         ReceiverType::Unknown, -1, false, "", /*strict_receiver=*/true, /*typed_argument=*/0},
+        {"io.WriteString", VulnClass::CrossSiteScripting, ReceiverType::HttpResponse,
+         ReceiverType::Unknown, -1, true, "", /*strict_receiver=*/true, /*typed_argument=*/0},
 
         {"Get", VulnClass::ServerSideRequestForgery, ReceiverType::HttpClient,
          ReceiverType::Unknown, 0, false, ""},
@@ -737,10 +795,37 @@ LanguageSpec make_go() {
         {"Redirect", VulnClass::OpenRedirect, ReceiverType::Unknown,
          ReceiverType::Unknown, 2, false, ""},
 
+        // Strict, because Unmarshal is the name every Go codec uses and almost
+        // all of them -- encoding/json, xml, protobuf -- are data-only. Left
+        // lenient, this reported every JSON request body as a CWE-502.
         {"Unmarshal", VulnClass::InsecureDeserialization, ReceiverType::Serializer,
-         ReceiverType::Unknown, 0, false, ""},
+         ReceiverType::Unknown, 0, false, "", /*strict_receiver=*/true},
         {"gob.NewDecoder", VulnClass::InsecureDeserialization, ReceiverType::Unknown,
          ReceiverType::Unknown, -1, true, "gob decoding of untrusted data is unsafe"},
+
+        // Code injection. Go has no eval, so the equivalents are the places a
+        // program hands a string to something that executes it: a template
+        // engine, an embedded interpreter, or the plugin loader.
+        {"Parse", VulnClass::RemoteCodeExecution, ReceiverType::Template,
+         ReceiverType::Unknown, 0, false,
+         "a template parsed from request data can call any method reachable from its inputs",
+         /*strict_receiver=*/true},
+        {"RunString", VulnClass::RemoteCodeExecution, ReceiverType::ScriptEngine,
+         ReceiverType::Unknown, 0, false, "goja executes its argument as JavaScript"},
+        {"DoString", VulnClass::RemoteCodeExecution, ReceiverType::ScriptEngine,
+         ReceiverType::Unknown, 0, false, "gopher-lua executes its argument as Lua"},
+        {"Run", VulnClass::RemoteCodeExecution, ReceiverType::ScriptEngine,
+         ReceiverType::Unknown, 0, false, "the interpreter executes its argument as source",
+         /*strict_receiver=*/true},
+        {"Eval", VulnClass::RemoteCodeExecution, ReceiverType::ScriptEngine,
+         ReceiverType::Unknown, 0, false, "the interpreter executes its argument as source",
+         /*strict_receiver=*/true},
+        {"expr.Eval", VulnClass::RemoteCodeExecution, ReceiverType::Unknown,
+         ReceiverType::Unknown, 0, true, "expr evaluates its argument as an expression"},
+        {"govaluate.NewEvaluableExpression", VulnClass::RemoteCodeExecution,
+         ReceiverType::Unknown, ReceiverType::Unknown, 0, true, ""},
+        {"plugin.Open", VulnClass::RemoteCodeExecution, ReceiverType::Unknown,
+         ReceiverType::Unknown, 0, true, "loads and runs a shared object chosen by the request"},
 
         {"Printf", VulnClass::LogInjection, ReceiverType::Logger,
          ReceiverType::Unknown, 1, false, ""},
@@ -768,6 +853,10 @@ LanguageSpec make_go() {
     };
 
     s.type_rules = {
+        // Matches the initialiser `db.Prepare(q)` and the chained receiver
+        // in `db.Prepare(q).QueryRow(x)`, and covers PrepareContext/Preparex.
+        {".Prepare", ReceiverType::PreparedStatement},
+        {"sql.Stmt", ReceiverType::PreparedStatement},
         {"sql.Open", ReceiverType::Database},
         {"sql.DB", ReceiverType::Database},
         {"sqlx", ReceiverType::Database},
@@ -789,6 +878,14 @@ LanguageSpec make_go() {
         {"encoding/gob", ReceiverType::Serializer},
         {"crypto", ReceiverType::Crypto},
         {"mongo.Collection", ReceiverType::MongoCollection},
+        {"log.Logger", ReceiverType::Logger},
+        {"template.New", ReceiverType::Template},
+        {"template.Must", ReceiverType::Template},
+        {"template.Template", ReceiverType::Template},
+        {"goja.New", ReceiverType::ScriptEngine},
+        {"otto.New", ReceiverType::ScriptEngine},
+        {"interp.New", ReceiverType::ScriptEngine},
+        {"lua.NewState", ReceiverType::ScriptEngine},
     };
 
     s.sanitizers = SanitizerTable({
@@ -837,11 +934,34 @@ std::vector<std::string> LanguageSpec::assignment_node_types() const {
     std::vector<std::string> types;
     types.reserve(assignment_forms.size());
     for (const auto& form : assignment_forms) {
-        if (std::find(types.begin(), types.end(), form.node_type) == types.end()) {
+        if (!std::ranges::contains(types, form.node_type)) {
             types.push_back(form.node_type);
         }
     }
     return types;
+}
+
+bool source_pattern_matches(std::string_view expression, std::string_view pattern) noexcept {
+    if (pattern.empty()) return false;
+
+    const auto is_identifier_char = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '_' || c == '$';
+    };
+    // A boundary is only required on a side where the pattern itself ends in
+    // an identifier character: `input(` already ends at a boundary.
+    const bool check_left = is_identifier_char(pattern.front());
+    const bool check_right = is_identifier_char(pattern.back());
+
+    for (std::size_t at = expression.find(pattern); at != std::string_view::npos;
+         at = expression.find(pattern, at + 1)) {
+        const std::size_t end = at + pattern.size();
+        const bool left_ok = !check_left || at == 0 || !is_identifier_char(expression[at - 1]);
+        const bool right_ok =
+            !check_right || end == expression.size() || !is_identifier_char(expression[end]);
+        if (left_ok && right_ok) return true;
+    }
+    return false;
 }
 
 const SourceRule* LanguageSpec::match_source(std::string_view expression) const {
@@ -849,7 +969,7 @@ const SourceRule* LanguageSpec::match_source(std::string_view expression) const 
     // present and the more specific description reaches the trace.
     const SourceRule* best = nullptr;
     for (const auto& rule : sources) {
-        if (!ast::contains(expression, rule.pattern)) continue;
+        if (!source_pattern_matches(expression, rule.pattern)) continue;
         if (best == nullptr || rule.pattern.size() > best->pattern.size()) best = &rule;
     }
     return best;
@@ -859,9 +979,9 @@ bool LanguageSpec::is_source_for(std::string_view expression, VulnClass id) cons
     // Any matching rule scoped to this class counts, not just the longest --
     // a broad source and a narrow one can both match the same expression.
     for (const auto& rule : sources) {
-        if (!ast::contains(expression, rule.pattern)) continue;
+        if (!source_pattern_matches(expression, rule.pattern)) continue;
         if (rule.classes.empty()) return true;
-        if (std::find(rule.classes.begin(), rule.classes.end(), id) != rule.classes.end()) {
+        if (std::ranges::contains(rule.classes, id)) {
             return true;
         }
     }
@@ -910,6 +1030,28 @@ const LanguageSpec* spec_for(Language language) {
 
 std::vector<Language> supported_languages() {
     return {Language::JavaScript, Language::Python, Language::Go};
+}
+
+std::vector<ClassCoverage> class_coverage(const LanguageSpec& spec) {
+    std::vector<ClassCoverage> coverage;
+    for (const auto& meta : all_vulnerability_classes()) {
+        if (meta.id == VulnClass::Unknown) continue;
+
+        ClassCoverage entry;
+        entry.id = meta.id;
+        entry.by_taint =
+            std::ranges::contains(spec.call_sinks, meta.id, &SinkRule::vulnerability) ||
+            std::ranges::contains(spec.property_sinks, meta.id, &PropertySinkRule::vulnerability);
+        entry.by_pattern = std::ranges::contains(spec.configuration_rules, meta.id,
+                                                 &ConfigurationRule::vulnerability);
+
+        // Secret detection lives in secrets.cpp and runs on every language; it
+        // has no row in these tables.
+        if (meta.id == VulnClass::HardcodedSecret) entry.by_pattern = true;
+
+        coverage.push_back(entry);
+    }
+    return coverage;
 }
 
 std::size_t total_rule_count() {

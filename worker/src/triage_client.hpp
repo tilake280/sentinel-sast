@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <expected>
 #include <string>
 
 #include "analyzer.hpp"
@@ -31,6 +32,15 @@ struct TriageVerdict {
 
     // Set when the breaker was open and no request was attempted.
     bool skipped_by_breaker = false;
+};
+
+// Why a triage attempt produced no verdict. `retryable` separates a fault that
+// might clear on its own (a timeout, a 503) from one that will not (a 4xx, or
+// a 200 whose body breaks the contract), so the retry loop does not have to
+// re-derive that from a status code it would otherwise need threaded through.
+struct TriageError {
+    std::string message;
+    bool retryable = false;
 };
 
 struct TriageStats {
@@ -81,9 +91,8 @@ private:
     void record_success();
     void record_failure();
 
-    // One HTTP attempt. Returns the raw body on success.
-    bool perform(const std::string& body, std::string& response, std::string& error,
-                 long& status);
+    // One HTTP attempt: the raw response body, or why there is not one.
+    std::expected<std::string, TriageError> perform(const std::string& body);
 
     TriageConfig config_;
     void* curl_ = nullptr;
@@ -98,7 +107,8 @@ private:
 // contract with the Python service is testable without a network call.
 std::string triage_payload(const Finding& finding);
 
-// Parses a triage response body. Exposed for the same reason.
-TriageVerdict parse_triage_response(const std::string& body);
+// Parses a triage response body. Exposed for the same reason. A body that does
+// not parse is never retryable: the service would send the same bytes again.
+std::expected<TriageVerdict, TriageError> parse_triage_response(const std::string& body);
 
 }  // namespace sentinel

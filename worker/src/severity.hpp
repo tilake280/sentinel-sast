@@ -45,6 +45,7 @@ struct ScoringContext {
     bool sink_matched_full_path = false;  // matched `child_process.exec`, not `exec`
     bool partially_sanitized = false;     // some but not all paths were cleaned
     bool inside_conditional = false;      // guarded by an if, so may be unreachable
+    bool source_is_local = false;         // argv/env/stdin rather than a remote request
 };
 
 struct Score {

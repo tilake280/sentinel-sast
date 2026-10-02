@@ -178,9 +178,29 @@ std::vector<TSNode> named_children(TSNode node) {
     if (ts_node_is_null(node)) return out;
     const uint32_t count = ts_node_named_child_count(node);
     out.reserve(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        out.push_back(ts_node_named_child(node, i));
+
+    // ts_node_named_child(node, i) walks from the first child every time, so
+    // indexing is quadratic in the number of children. That is nothing for the
+    // usual handful, and everything for a minified file whose top level is one
+    // declaration with a thousand declarators. A cursor steps sibling to
+    // sibling in constant time; it costs an allocation, so it is used only
+    // once a node is wide enough for the difference to show.
+    constexpr uint32_t kWideNode = 16;
+    if (count <= kWideNode) {
+        for (uint32_t i = 0; i < count; ++i) {
+            out.push_back(ts_node_named_child(node, i));
+        }
+        return out;
     }
+
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            const TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child)) out.push_back(child);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
     return out;
 }
 
@@ -208,10 +228,8 @@ void walk(TSNode root, const std::function<void(TSNode)>& visit) {
         visit(node);
 
         // Push in reverse so children are visited left to right.
-        const uint32_t count = ts_node_named_child_count(node);
-        for (uint32_t i = count; i > 0; --i) {
-            stack.push_back(ts_node_named_child(node, i - 1));
-        }
+        const auto children = named_children(node);
+        stack.insert(stack.end(), children.rbegin(), children.rend());
     }
 }
 
@@ -224,10 +242,8 @@ void walk_pruned(TSNode root, const std::function<bool(TSNode)>& visit) {
         stack.pop_back();
         if (!visit(node)) continue;  // caller declined this subtree
 
-        const uint32_t count = ts_node_named_child_count(node);
-        for (uint32_t i = count; i > 0; --i) {
-            stack.push_back(ts_node_named_child(node, i - 1));
-        }
+        const auto children = named_children(node);
+        stack.insert(stack.end(), children.rbegin(), children.rend());
     }
 }
 
@@ -236,7 +252,7 @@ std::optional<TSNode> find_ancestor(TSNode node, const std::vector<std::string_v
     TSNode current = ts_node_parent(node);
     while (!ts_node_is_null(current)) {
         const std::string_view type = node_type(current);
-        if (std::find(types.begin(), types.end(), type) != types.end()) return current;
+        if (std::ranges::contains(types, type)) return current;
         current = ts_node_parent(current);
     }
     return std::nullopt;
@@ -260,8 +276,7 @@ void collect_identifiers(TSNode node, const std::string& source, std::vector<std
     walk(node, [&](TSNode current) {
         if (one_of(node_type(current), kIdentifierTypes)) {
             std::string text = node_text(source, current);
-            if (!text.empty() &&
-                std::find(out.begin(), out.end(), text) == out.end()) {
+            if (!text.empty() && !std::ranges::contains(out, text)) {
                 out.push_back(std::move(text));
             }
         }
@@ -362,16 +377,15 @@ std::string to_lower(std::string_view value) {
 }
 
 bool contains(std::string_view haystack, std::string_view needle) noexcept {
-    return haystack.find(needle) != std::string_view::npos;
+    return haystack.contains(needle);
 }
 
 bool starts_with(std::string_view value, std::string_view prefix) noexcept {
-    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+    return value.starts_with(prefix);
 }
 
 bool ends_with(std::string_view value, std::string_view suffix) noexcept {
-    return value.size() >= suffix.size() &&
-           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return value.ends_with(suffix);
 }
 
 std::string string_literal_value(std::string_view raw) {

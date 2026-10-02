@@ -1,0 +1,70 @@
+Sentinel SAST benchmark
+=======================
+worker 0.3.0  |  corpus: 12 repositories at pinned commits (benchmark/corpus.json)
+
+Files
+-----
+659 source files scanned, 8308 functions
+  language    files
+  ----------  -----
+  javascript    205
+  python        201
+  go            253
+  1 minified file(s) skipped; 1 file(s) had parse errors and were analysed anyway
+  analysis time 5.5s (wall 6.9s including triage calls)
+
+Findings by class and language
+------------------------------
+  class                        javascript  python  go  total
+  ---------------------------  ----------  ------  --  -----
+  Weak Cryptography                     8       7  11     26
+  Log Injection                         3       5  12     20
+  Command Injection                     2       6   0      8
+  Cross-Site Scripting                  0       0   8      8
+  Remote Code Execution                 4       3   0      7
+  NoSQL Injection                       6       0   0      6
+  Open Redirect                         6       0   0      6
+  SQL Injection                         1       3   1      5
+  Hardcoded Secret                      2       2   0      4
+  Path Traversal                        0       3   1      4
+  Insecure Deserialization              0       2   0      2
+  Server-Side Request Forgery           0       1   0      1
+  total                                32      32  33     97
+  12 classes reported; 0 finding(s) silenced by inline directives in the scanned code
+
+Triage verdicts
+---------------
+  verdict     findings
+  ----------  --------
+  ESCALATED         97
+  SUPPRESSED         0
+  UNTRIAGED          0
+  97 of 97 findings received a verdict from the triage layer.
+
+By repository
+-------------
+  repository            kind            language    files  findings  per 100 files  escalated  suppressed  untriaged
+  --------------------  --------------  ----------  -----  --------  -------------  ---------  ----------  ---------
+  NodeGoat              vulnerable-app  javascript     44        15           34.1         15           0          0
+  dvna                  vulnerable-app  javascript     12        10           83.3         10           0          0
+  express               ordinary        javascript    141         6            4.3          6           0          0
+  pygoat                vulnerable-app  python         52        19           36.5         19           0          0
+  vulpy                 vulnerable-app  python         63         1            1.6          1           0          0
+  Vulnerable-Flask-App  vulnerable-app  python          3         7          233.3          7           0          0
+  DSVW                  vulnerable-app  python          6         1           16.7          1           0          0
+  flask                 ordinary        python         83         4            4.8          4           0          0
+  govwa                 vulnerable-app  go             22        16           72.7         16           0          0
+  go-test-bench         vulnerable-app  go            129         8            6.2          8           0          0
+  Go-SCP                vulnerable-app  go              5         0            0.0          0           0          0
+  gin                   ordinary        go             99        10           10.1         10           0          0
+  vulnerable-app: 77 findings in 336 files (22.9 per 100 files)
+  ordinary: 20 findings in 323 files (6.2 per 100 files)
+
+Precision on the labelled sample
+--------------------------------
+Sample: 50 of 97 findings, drawn with fixed seed 20261002.
+  labelled 50 of 50: 24 true positive, 26 false positive, 0 undecided
+  precision 48% (24/50 of the decided labels)
+  Labels are one reviewer's reading of the code; see the reason column in
+  benchmark/labels.csv. This is precision only -- recall is not measured.
+

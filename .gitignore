@@ -28,3 +28,6 @@ gateway/gateway
 .vscode/
 .idea/
 .DS_Store
+
+# Benchmark corpus: third-party repositories fetched by scripts/fetch_corpus.py
+benchmark/corpus/

@@ -88,19 +88,14 @@ TaintFact merge(const TaintFact& a, const TaintFact& b) {
     const bool a_broader = a.sanitized.raw() == out.sanitized.raw();
     const bool b_broader = b.sanitized.raw() == out.sanitized.raw();
 
-    if (a_broader && !b_broader) {
-        out.origin = a.origin;
-        out.trace = a.trace;
-    } else if (b_broader && !a_broader) {
-        out.origin = b.origin;
-        out.trace = b.trace;
-    } else if (a.trace.size() <= b.trace.size()) {
-        out.origin = a.origin;
-        out.trace = a.trace;
-    } else {
-        out.origin = b.origin;
-        out.trace = b.trace;
-    }
+    const bool take_a = (a_broader != b_broader) ? a_broader
+                                                 : a.trace.size() <= b.trace.size();
+    const TaintFact& chosen = take_a ? a : b;
+    out.origin = chosen.origin;
+    out.trace = chosen.trace;
+
+    // Reachable from a remote request by either path means it is remote.
+    out.local = a.local && b.local;
     return out;
 }
 

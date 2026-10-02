@@ -73,8 +73,7 @@ bool ValidatorTable::guards(std::string_view dotted_callee, VulnClass id) const 
     const ValidatorRule* rule = find(dotted_callee);
     if (rule == nullptr) return false;
     if (rule->relevant_to.empty()) return true;  // relevant to everything
-    return std::find(rule->relevant_to.begin(), rule->relevant_to.end(), id) !=
-           rule->relevant_to.end();
+    return std::ranges::contains(rule->relevant_to, id);
 }
 
 }  // namespace sentinel

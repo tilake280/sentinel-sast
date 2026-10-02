@@ -34,7 +34,19 @@ struct SourceRule {
     // Some sources are only dangerous for certain classes. A filename from a
     // multipart upload is a path-traversal source but not a SQL one.
     std::vector<VulnClass> classes;  // empty means all classes
+
+    // The value comes from whoever runs the program -- argv, the environment,
+    // stdin -- rather than from a remote request. It is still untrusted input
+    // to a setuid binary or a CI job, so it stays a source, but a build script
+    // shelling out with its own environment is not the finding a handler
+    // shelling out with a query parameter is. Lowers confidence, nothing else.
+    bool local = false;
 };
+
+// True when `pattern` occurs in `expression` as whole name segments. A plain
+// substring test matched `r.Form` inside `r.Format` and `req.file` inside
+// `req.filename`: the pattern has to end, and begin, where an identifier does.
+bool source_pattern_matches(std::string_view expression, std::string_view pattern) noexcept;
 
 // A dangerous callee.
 struct SinkRule {
@@ -58,6 +70,24 @@ struct SinkRule {
     bool require_full_path = false;
 
     std::string note;  // appended to the finding message
+
+    // The type guards above are lenient by default: a receiver the inference
+    // could not resolve still fires the rule, at lower confidence. That is the
+    // wrong trade for a callee whose name is only dangerous on one kind of
+    // object -- `Parse`, `Run`, `Write`. When set, the rule fires only if the
+    // guarded type actually resolved to `required_receiver`.
+    bool strict_receiver = false;
+
+    // When >= 0, the guards apply to this argument instead of the callee's
+    // receiver. `fmt.Fprintf(w, ...)` writes HTML only when `w` is an
+    // http.ResponseWriter, and `w` is an argument there, not the receiver.
+    int typed_argument = -1;
+
+    // When set, the rule does not fire if the checked argument is an object
+    // literal with this key. `Model.find({ where: {...} })` is an ORM query
+    // whose values are bound by the ORM; a document-database filter has no
+    // top-level `where`. The two share a method name and nothing else.
+    std::string skip_if_argument_has_key = {};
 };
 
 // A property write that is a sink: `el.innerHTML = tainted`.
@@ -75,6 +105,13 @@ struct ConfigurationRule {
     VulnClass vulnerability = VulnClass::Unknown;
     Severity severity = Severity::Medium;
     std::string message;
+
+    // The call is only a finding where its result is used for something that
+    // needs to be unpredictable. Math.random() picking a tooltip id or a demo
+    // date is not a weakness; Math.random() producing a session token is.
+    // When set, the rule fires only if the enclosing statement or function
+    // names something security-relevant.
+    bool needs_security_context = false;
 };
 
 struct LanguageSpec {
@@ -119,12 +156,21 @@ struct LanguageSpec {
     std::string function_body_field = "body";
 
     std::vector<std::string> return_node_types;
+
+    // What a function body looks like when it is a block of statements. A body
+    // of any other type is an expression, and the function returns it:
+    // `(v) => v + 1`, `lambda v: v + 1`.
+    std::vector<std::string> block_node_types;
     std::vector<std::string> comment_node_types;
     std::vector<std::string> import_node_types;
     std::vector<std::string> pair_node_types;        // object literal / dict entries
     std::vector<std::string> concatenation_node_types;
     std::vector<std::string> conditional_node_types;
     std::vector<std::string> subscript_node_types;
+
+    // Parameter declarations that spell out a type, for languages that have
+    // them. Feeds receiver-type inference.
+    std::vector<TypedParameterForm> typed_parameter_forms;
 
     // ---- Rule tables ------------------------------------------------------
 
@@ -155,5 +201,19 @@ std::vector<Language> supported_languages();
 // Total rule count across all languages, printed at startup so a deployment can
 // confirm it is running the ruleset it expects.
 std::size_t total_rule_count();
+
+// How one class is detected in one language, read straight off the rule
+// tables. This is what `--rules` prints, so a coverage claim can be checked
+// against the binary instead of against prose.
+struct ClassCoverage {
+    VulnClass id = VulnClass::Unknown;
+    bool by_taint = false;    // a source reaching a call or property sink
+    bool by_pattern = false;  // a configuration or literal pattern, no dataflow
+
+    bool detected() const noexcept { return by_taint || by_pattern; }
+};
+
+// One entry per class in registry order, whether or not it is detected.
+std::vector<ClassCoverage> class_coverage(const LanguageSpec& spec);
 
 }  // namespace sentinel

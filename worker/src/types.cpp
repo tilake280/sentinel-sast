@@ -25,6 +25,7 @@ std::string_view to_string(ReceiverType type) noexcept {
     switch (type) {
         case ReceiverType::Unknown: return "unknown";
         case ReceiverType::Database: return "database";
+        case ReceiverType::PreparedStatement: return "prepared-statement";
         case ReceiverType::DomElement: return "dom-element";
         case ReceiverType::ChildProcess: return "child-process";
         case ReceiverType::FileSystem: return "filesystem";
@@ -33,6 +34,7 @@ std::string_view to_string(ReceiverType type) noexcept {
         case ReceiverType::Logger: return "logger";
         case ReceiverType::Regex: return "regex";
         case ReceiverType::Template: return "template";
+        case ReceiverType::ScriptEngine: return "script-engine";
         case ReceiverType::Crypto: return "crypto";
         case ReceiverType::Serializer: return "serializer";
         case ReceiverType::DataCodec: return "data-codec";
@@ -115,7 +117,8 @@ ReceiverType TypeEnvironment::receiver_type_of(std::string_view dotted_callee,
 TypeEnvironment build_type_environment(const ast::ParsedFile& file, TSNode root,
                                        const std::vector<TypeRule>& rules,
                                        const std::vector<std::string>& import_node_types,
-                                       const std::vector<std::string>& assignment_node_types) {
+                                       const std::vector<std::string>& assignment_node_types,
+                                       const std::vector<TypedParameterForm>& typed_parameters) {
     TypeEnvironment env;
     const std::string& source = file.source();
 
@@ -123,9 +126,7 @@ TypeEnvironment build_type_environment(const ast::ParsedFile& file, TSNode root,
         const std::string_view type = ast::node_type(node);
 
         // ---- Imports ------------------------------------------------------
-        const bool is_import =
-            std::find(import_node_types.begin(), import_node_types.end(), type) !=
-            import_node_types.end();
+        const bool is_import = std::ranges::contains(import_node_types, type);
 
         if (is_import) {
             const std::string text = ast::node_text(source, node);
@@ -140,10 +141,28 @@ TypeEnvironment build_type_environment(const ast::ParsedFile& file, TSNode root,
             return;
         }
 
+        // ---- Typed parameters ---------------------------------------------
+        for (const auto& form : typed_parameters) {
+            if (type != form.node_type) continue;
+
+            const TSNode declared = ast::child_by_field(node, form.type_field);
+            if (ts_node_is_null(declared)) return;
+            const std::string declared_type = ast::node_text(source, declared);
+
+            // `func f(a, b *sql.DB)` declares two names with one type, and the
+            // grammar repeats the `name` field once per name.
+            const uint32_t count = ts_node_child_count(node);
+            for (uint32_t i = 0; i < count; ++i) {
+                const char* field = ts_node_field_name_for_child(node, i);
+                if (field == nullptr || form.name_field != field) continue;
+                env.observe_binding(ast::node_text(source, ts_node_child(node, i)),
+                                    declared_type, rules);
+            }
+            return;
+        }
+
         // ---- Assignments --------------------------------------------------
-        const bool is_assignment =
-            std::find(assignment_node_types.begin(), assignment_node_types.end(), type) !=
-            assignment_node_types.end();
+        const bool is_assignment = std::ranges::contains(assignment_node_types, type);
 
         if (!is_assignment) return;
 

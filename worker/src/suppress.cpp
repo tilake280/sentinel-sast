@@ -24,7 +24,7 @@ std::vector<VulnClass> parse_class_list(std::string_view list, bool& saw_unknown
             const VulnClass id = vuln_class_from_slug(token);
             if (id == VulnClass::Unknown) {
                 saw_unknown = true;
-            } else if (std::find(classes.begin(), classes.end(), id) == classes.end()) {
+            } else if (!std::ranges::contains(classes, id)) {
                 classes.push_back(id);
             }
         }
@@ -62,7 +62,7 @@ std::string_view strip_comment_markers(std::string_view text) {
 
 bool Suppression::covers(VulnClass id) const {
     if (classes.empty()) return true;  // bare `sentinel:ignore` covers everything
-    return std::find(classes.begin(), classes.end(), id) != classes.end();
+    return std::ranges::contains(classes, id);
 }
 
 std::optional<Suppression> parse_suppression_comment(std::string_view comment_text, int line) {
@@ -171,10 +171,7 @@ SuppressionIndex collect_suppressions(const ast::ParsedFile& file, TSNode root,
 
     ast::walk(root, [&](TSNode node) {
         const std::string_view type = ast::node_type(node);
-        if (std::find(comment_node_types.begin(), comment_node_types.end(), type) ==
-            comment_node_types.end()) {
-            return;
-        }
+        if (!std::ranges::contains(comment_node_types, type)) return;
 
         const std::string text = ast::node_text(source, node);
         auto parsed = parse_suppression_comment(text, ast::start_line(node));

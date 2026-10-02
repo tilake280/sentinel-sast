@@ -1,6 +1,7 @@
 #include "severity.hpp"
 
 #include <algorithm>
+#include <utility>
 #include <format>
 
 namespace sentinel {
@@ -16,7 +17,7 @@ constexpr int kConfidenceMediumThreshold = 2;
 int Score::priority() const {
     // Severity dominates, confidence breaks ties. Scaling by 10 leaves room for
     // confidence to matter without ever letting a Low outrank a Critical.
-    return static_cast<int>(severity) * 10 + static_cast<int>(confidence);
+    return std::to_underlying(severity) * 10 + std::to_underlying(confidence);
 }
 
 Score score_finding(const ScoringContext& context) {
@@ -86,12 +87,24 @@ Score score_finding(const ScoringContext& context) {
         score.factors.emplace_back("sink is inside a conditional and may be unreachable");
     }
 
+
     if (points >= kConfidenceHighThreshold) {
         score.confidence = Confidence::High;
     } else if (points >= kConfidenceMediumThreshold) {
         score.confidence = Confidence::Medium;
     } else {
         score.confidence = Confidence::Low;
+    }
+
+    // A cap rather than a penalty: however direct the flow, whoever sets argv
+    // or the environment can usually already do what the sink would let them.
+    // It matters for a setuid binary or a CI job, so the finding stays; it is
+    // just never something to act on without checking who supplies the input.
+    if (context.source_is_local) {
+        score.confidence = Confidence::Low;
+        score.factors.emplace_back(
+            "input comes from the command line or environment, which the operator "
+            "controls, rather than from a remote request");
     }
 
     // ---- Severity adjustment ----------------------------------------------

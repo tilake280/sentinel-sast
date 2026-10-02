@@ -81,6 +81,10 @@ struct FileReport {
     bool had_parse_errors = false;
     bool language_supported = false;
 
+    // The file is minified or otherwise machine-generated and was not
+    // analysed. See looks_minified().
+    bool skipped_minified = false;
+
     std::size_t functions_analyzed = 0;
     std::size_t summaries_computed = 0;
     std::size_t suppressed_count = 0;
@@ -95,13 +99,25 @@ struct FileReport {
 // produces an empty report with the relevant flag set.
 FileReport analyze_file_detailed(const std::string& repository, const SourceFile& file);
 
+// True when a file reads as minified: a bundle squeezed onto a few very long
+// lines. Such a file is build output, not source. Findings in it cannot be
+// fixed where they are reported, they are overwhelmingly noise from library
+// internals, and a single 90 KB bundle is slower to analyse than the rest of a
+// repository put together -- so it is skipped, and reported as skipped.
+//
+// The test is the mean line length, above a size floor. Hand-written code in
+// these languages averages 20 to 40 characters a line; the floor keeps a small
+// file with one long line (a data literal, an embedded key) from tripping it.
+bool looks_minified(std::string_view content) noexcept;
+
 // Convenience wrapper preserving the original signature.
 std::vector<Finding> analyze_file(const std::string& repository, const SourceFile& file);
 
 // Aggregate across a whole scan job.
 struct ScanSummary {
     std::size_t files_scanned = 0;
-    std::size_t files_skipped = 0;
+    std::size_t files_skipped = 0;           // unsupported language
+    std::size_t files_minified = 0;          // supported, but generated code
     std::size_t files_with_parse_errors = 0;
     std::size_t total_findings = 0;
     std::size_t suppressed_inline = 0;

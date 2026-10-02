@@ -1,41 +1,93 @@
+// Sentinel SAST API gateway.
+//
+// Receives GitHub push webhooks, records a scan, fetches the changed source
+// files and queues them for the analysis worker; consumes the worker's results
+// and stores them; and serves scans and findings to the frontend.
+//
+//	webhook -> gateway -> scan_jobs -> worker -> scan_results -> gateway -> Postgres
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
-	"github.com/gofiber/fiber/v2"
+	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
 	"github.com/gofiber/fiber/v2/middleware/logger"
 )
 
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+// rabbitURL builds the broker URL from the same variables the worker reads, so
+// one .env configures both. RABBITMQ_URL overrides them when set.
+func rabbitURL() string {
+	if value := os.Getenv("RABBITMQ_URL"); value != "" {
+		return value
+	}
+	return fmt.Sprintf("amqp://%s:%s@%s:%s/",
+		url.QueryEscape(envOr("RABBITMQ_USER", "guest")),
+		url.QueryEscape(envOr("RABBITMQ_PASSWORD", "guest")),
+		envOr("RABBITMQ_HOST", "localhost"),
+		envOr("RABBITMQ_PORT", "5672"))
+}
+
 func main() {
-	app := fiber.New(fiber.Config{
-		AppName: "Sentinel SAST API Gateway",
-	})
+	addr := envOr("GATEWAY_ADDR", ":3001")
+	databaseURL := envOr("DATABASE_URL", "postgres://sentinel:password@localhost:5432/sentinel_db")
+	scanQueue := envOr("SCAN_QUEUE", "scan_jobs")
+	resultsQueue := envOr("RESULTS_QUEUE", "scan_results")
+	secret := os.Getenv("GITHUB_WEBHOOK_SECRET")
 
-	app.Use(logger.New())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	api := app.Group("/api/v1")
+	startup, cancel := context.WithTimeout(ctx, 15*time.Second)
+	store, err := NewPostgresStore(startup, databaseURL)
+	cancel()
+	if err != nil {
+		log.Fatalf("gateway: %v", err)
+	}
+	defer store.Close()
 
-	// Health Check
-	api.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status": "online",
-			"message": "Sentinel API Gateway is running",
-		})
-	})
+	broker := NewBroker(rabbitURL())
+	defer broker.Close()
 
-	// Webhook Ingestion Endpoint
-	api.Post("/webhook", func(c *fiber.Ctx) error {
-		// Mock receiving a push event
-		payload := string(c.Body())
-		log.Printf("Received Webhook Payload: %s", payload)
-		
-		// TODO: Validate signature, insert PENDING record to Postgres, push to RabbitMQ
-		
-		return c.Status(202).JSON(fiber.Map{
-			"status": "accepted",
-			"message": "Scan job queued",
-		})
-	})
+	if secret == "" {
+		log.Print("gateway: GITHUB_WEBHOOK_SECRET is not set; every webhook will be refused")
+	}
 
-	log.Fatal(app.Listen(":3001"))
+	// The consumer reconnects on its own, so a broker that is down at startup
+	// delays results rather than stopping the gateway from serving reads.
+	go broker.ConsumeResults(ctx, resultsQueue, store)
+
+	app := NewApp(Deps{
+		Store:     store,
+		Publisher: broker,
+		Fetcher: NewRawFetcher(
+			envOr("GITHUB_RAW_BASE_URL", "https://raw.githubusercontent.com"),
+			os.Getenv("GITHUB_TOKEN")),
+		Secret:    secret,
+		ScanQueue: scanQueue,
+	}, logger.New())
+
+	go func() {
+		<-ctx.Done()
+		if err := app.ShutdownWithTimeout(10 * time.Second); err != nil {
+			log.Printf("gateway: shutdown: %v", err)
+		}
+	}()
+
+	log.Printf("gateway: listening on %s (jobs -> %s, results <- %s)", addr, scanQueue, resultsQueue)
+	if err := app.Listen(addr); err != nil {
+		log.Fatalf("gateway: %v", err)
+	}
 }

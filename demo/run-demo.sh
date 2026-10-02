@@ -246,9 +246,9 @@ fi
 
 # ---------------------------------------------------------------------------
 if section 11 "The test suite"; then
-  note "174 assertions across 13 suites. No broker, no database, no network —"
-  note "the analysis core has no I/O dependencies, which is what makes the"
-  note "suite runnable on a clean checkout."
+  note "No broker, no database, no network — the analysis core has no I/O"
+  note "dependencies, which is what makes the suite runnable on a clean checkout."
+  note "The binary prints its own assertion and scan counts at the end."
   printf '\n'
   run "cd '$ROOT/worker' && make test 2>&1 | tail -32"
   pause

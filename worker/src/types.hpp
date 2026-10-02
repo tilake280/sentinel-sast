@@ -36,6 +36,7 @@ namespace sentinel {
 enum class ReceiverType {
     Unknown,
     Database,       // pg.Pool, mysql connection, sqlite3, cursor, *sql.DB
+    PreparedStatement,  // *sql.Stmt: its Query/Exec arguments are bound values
     DomElement,     // document.getElementById(...), createElement
     ChildProcess,   // node child_process, python subprocess, go os/exec
     FileSystem,     // fs, os, io/ioutil
@@ -44,6 +45,7 @@ enum class ReceiverType {
     Logger,         // winston, logging.getLogger, log.Logger
     Regex,          // RegExp literal or constructor
     Template,       // template engines
+    ScriptEngine,   // an embedded interpreter: goja, otto, yaegi, gopher-lua
     Crypto,         // crypto, hashlib
     Serializer,     // pickle, yaml, gob -- can construct arbitrary objects
     // JSON and friends are serializers too, but data-only: they cannot
@@ -98,9 +100,21 @@ ReceiverType infer_from_expression(std::string_view expression,
 
 // Walks a parsed file and populates a TypeEnvironment from its imports,
 // assignments and regex literals.
+//
+// `typed_parameters` names the declarations that carry an explicit type, for
+// languages that have them. In Go a handler's `w http.ResponseWriter` is the
+// only place the type of `w` is ever written down, so without this pass the
+// most reliable type information in the file went unused.
+struct TypedParameterForm {
+    std::string node_type;
+    std::string name_field;
+    std::string type_field;
+};
+
 TypeEnvironment build_type_environment(const ast::ParsedFile& file, TSNode root,
                                        const std::vector<TypeRule>& rules,
                                        const std::vector<std::string>& import_node_types,
-                                       const std::vector<std::string>& assignment_node_types);
+                                       const std::vector<std::string>& assignment_node_types,
+                                       const std::vector<TypedParameterForm>& typed_parameters = {});
 
 }  // namespace sentinel

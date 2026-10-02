@@ -307,12 +307,8 @@ std::vector<SecretCandidate> scan_for_secrets(const ast::ParsedFile& file, TSNod
     ast::walk(root, [&](TSNode node) {
         const std::string_view type = ast::node_type(node);
 
-        const bool is_assignment =
-            std::find(assignment_node_types.begin(), assignment_node_types.end(), type) !=
-            assignment_node_types.end();
-        const bool is_pair =
-            std::find(pair_node_types.begin(), pair_node_types.end(), type) !=
-            pair_node_types.end();
+        const bool is_assignment = std::ranges::contains(assignment_node_types, type);
+        const bool is_pair = std::ranges::contains(pair_node_types, type);
 
         if (!is_assignment && !is_pair) return;
 

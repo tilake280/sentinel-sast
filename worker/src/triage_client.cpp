@@ -9,6 +9,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "version.hpp"
+
 using json = nlohmann::json;
 
 namespace sentinel {
@@ -60,10 +62,11 @@ std::string triage_payload(const Finding& finding) {
     return payload.dump();
 }
 
-TriageVerdict parse_triage_response(const std::string& body) {
-    TriageVerdict verdict;
+std::expected<TriageVerdict, TriageError> parse_triage_response(const std::string& body) {
     try {
         const json parsed = json::parse(body);
+
+        TriageVerdict verdict;
         verdict.ok = true;
         verdict.suppress = parsed.value("suppress", false);
         verdict.confidence = parsed.value("confidence", 0.0);
@@ -72,11 +75,11 @@ TriageVerdict parse_triage_response(const std::string& body) {
         if (parsed.contains("nearest_match") && parsed["nearest_match"].is_object()) {
             verdict.nearest_snippet = parsed["nearest_match"].value("snippet", "");
         }
+        return verdict;
     } catch (const json::exception& e) {
-        verdict.ok = false;
-        verdict.error = std::format("malformed triage response: {}", e.what());
+        return std::unexpected(
+            TriageError{std::format("malformed triage response: {}", e.what()), false});
     }
-    return verdict;
 }
 
 TriageClient::TriageClient(TriageConfig config) : config_(std::move(config)) {
@@ -124,19 +127,20 @@ void TriageClient::record_failure() {
     }
 }
 
-bool TriageClient::perform(const std::string& body, std::string& response, std::string& error,
-                           long& status) {
+std::expected<std::string, TriageError> TriageClient::perform(const std::string& body) {
     auto* curl = static_cast<CURL*>(curl_);
     if (curl == nullptr) {
-        error = "curl handle not initialised";
-        return false;
+        // No handle means no status either, which is_retryable treats as a
+        // transport fault -- the same classification this path always had.
+        return std::unexpected(TriageError{"curl handle not initialised", is_retryable(0)});
     }
 
-    response.clear();
-    status = 0;
+    std::string response;
+    long status = 0;
 
     curl_slist* headers = curl_slist_append(nullptr, "Content-Type: application/json");
-    headers = curl_slist_append(headers, "User-Agent: sentinel-worker/0.2.0");
+    headers = curl_slist_append(
+        headers, std::format("User-Agent: sentinel-worker/{}", kVersion).c_str());
     headers = curl_slist_append(headers, "Accept: application/json");
 
     curl_easy_reset(curl);
@@ -157,14 +161,14 @@ bool TriageClient::perform(const std::string& body, std::string& response, std::
     curl_slist_free_all(headers);
 
     if (rc != CURLE_OK) {
-        error = curl_easy_strerror(rc);
-        return false;
+        return std::unexpected(TriageError{curl_easy_strerror(rc), is_retryable(status)});
     }
     if (status < 200 || status >= 300) {
-        error = std::format("triage layer returned HTTP {}: {}", status, response);
-        return false;
+        return std::unexpected(
+            TriageError{std::format("triage layer returned HTTP {}: {}", status, response),
+                        is_retryable(status)});
     }
-    return true;
+    return response;
 }
 
 TriageVerdict TriageClient::triage(const Finding& finding) {
@@ -180,29 +184,28 @@ TriageVerdict TriageClient::triage(const Finding& finding) {
     const std::string body = triage_payload(finding);
     const auto started = std::chrono::steady_clock::now();
 
-    std::string response;
-    std::string error;
-    long status = 0;
+    TriageError last_error;
 
     for (int attempt = 1; attempt <= config_.max_attempts; ++attempt) {
         ++stats_.requests;
 
-        if (perform(body, response, error, status)) {
-            verdict = parse_triage_response(response);
-            if (verdict.ok) {
-                const auto elapsed = std::chrono::steady_clock::now() - started;
-                stats_.total_latency_ms +=
-                    std::chrono::duration<double, std::milli>(elapsed).count();
-                record_success();
-                return verdict;
-            }
-            // A 200 with a body we cannot parse is a contract violation, not a
-            // transient fault -- retrying will produce the same bytes.
-            record_failure();
-            return verdict;
+        // Transport and parsing fail differently but lead to the same place, so
+        // they are one chain: a body, then a verdict, or the first error.
+        const auto outcome = perform(body).and_then(parse_triage_response);
+        if (outcome) {
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+            stats_.total_latency_ms +=
+                std::chrono::duration<double, std::milli>(elapsed).count();
+            record_success();
+            return *outcome;
         }
 
-        if (attempt < config_.max_attempts && is_retryable(status)) {
+        last_error = outcome.error();
+
+        // A 200 with a body we cannot parse is a contract violation, not a
+        // transient fault -- retrying will produce the same bytes. That, and
+        // every 4xx, arrive here marked non-retryable.
+        if (attempt < config_.max_attempts && last_error.retryable) {
             ++stats_.retries;
             std::this_thread::sleep_for(backoff_for(attempt));
             continue;
@@ -212,7 +215,8 @@ TriageVerdict TriageClient::triage(const Finding& finding) {
 
     record_failure();
     verdict.ok = false;
-    verdict.error = error.empty() ? "triage request failed" : error;
+    verdict.error =
+        last_error.message.empty() ? "triage request failed" : std::move(last_error.message);
     return verdict;
 }
 

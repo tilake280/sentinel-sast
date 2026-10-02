@@ -1,0 +1,113 @@
+{
+  "description": "Public repositories the benchmark scans, each pinned to one commit so a run is reproducible. A mix of deliberately vulnerable teaching applications and ordinary, maintained projects: the first shows what the analyzer finds where vulnerabilities are known to exist, the second shows how much it reports on code that is not known to be vulnerable.",
+  "repositories": [
+    {
+      "name": "NodeGoat",
+      "url": "https://github.com/OWASP/NodeGoat",
+      "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
+      "language": "javascript",
+      "kind": "vulnerable-app",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "dvna",
+      "url": "https://github.com/appsecco/dvna",
+      "commit": "9ba473add536f66ac9007966acb2a775dd31277a",
+      "language": "javascript",
+      "kind": "vulnerable-app",
+      "license": "MIT"
+    },
+    {
+      "name": "express",
+      "url": "https://github.com/expressjs/express",
+      "commit": "7ef98448f8b38099ab1ded55e458538ad47a51e7",
+      "language": "javascript",
+      "kind": "ordinary",
+      "license": "MIT"
+    },
+    {
+      "name": "pygoat",
+      "url": "https://github.com/adeyosemanputra/pygoat",
+      "commit": "19d17cc8874861142b330636d068bbde54e86b85",
+      "language": "python",
+      "kind": "vulnerable-app",
+      "license": "MIT"
+    },
+    {
+      "name": "vulpy",
+      "url": "https://github.com/fportantier/vulpy",
+      "commit": "5249cc8b05a1c37f6b2f757b1cf16a509c327122",
+      "language": "python",
+      "kind": "vulnerable-app",
+      "license": "MIT"
+    },
+    {
+      "name": "Vulnerable-Flask-App",
+      "url": "https://github.com/we45/Vulnerable-Flask-App",
+      "commit": "b6a4f97afd466e83e1f60781494252dec1c37039",
+      "language": "python",
+      "kind": "vulnerable-app",
+      "license": "none stated"
+    },
+    {
+      "name": "DSVW",
+      "url": "https://github.com/stamparm/DSVW",
+      "commit": "9ca3c9acf3defa0a6148d40e5f5cebeb5dcbb908",
+      "language": "python",
+      "kind": "vulnerable-app",
+      "license": "Unlicense"
+    },
+    {
+      "name": "flask",
+      "url": "https://github.com/pallets/flask",
+      "commit": "d73fa1cdcbd8b1465c151db8924ba58b1dd14e35",
+      "language": "python",
+      "kind": "ordinary",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "govwa",
+      "url": "https://github.com/0c34/govwa",
+      "commit": "4058f79f31eeb4a36d8f1e64bba1f0c899646e6f",
+      "language": "go",
+      "kind": "vulnerable-app",
+      "license": "none stated"
+    },
+    {
+      "name": "go-test-bench",
+      "url": "https://github.com/Contrast-Security-OSS/go-test-bench",
+      "commit": "92445700823205281369911a72b7127f18c8c9ed",
+      "language": "go",
+      "kind": "vulnerable-app",
+      "license": "MIT"
+    },
+    {
+      "name": "Go-SCP",
+      "url": "https://github.com/OWASP/Go-SCP",
+      "commit": "e6c92359bb1733c14c9d1a5218144c8102f82df0",
+      "language": "go",
+      "kind": "vulnerable-app",
+      "license": "CC-BY-SA-4.0"
+    },
+    {
+      "name": "gin",
+      "url": "https://github.com/gin-gonic/gin",
+      "commit": "43fe48e8a0f44af783116cdb010725e6bb50255f",
+      "language": "go",
+      "kind": "ordinary",
+      "license": "MIT"
+    }
+  ],
+  "exclude": {
+    "directories": [
+      "static",
+      "bower_components",
+      "migrations"
+    ],
+    "suffixes": [
+      ".min.js"
+    ],
+    "why": "Front-end assets served from static/ are vendored libraries (jQuery, Bootstrap), not the project's own code; Django migrations are generated. The worker additionally skips node_modules, vendor, dist, build and similar on its own."
+  },
+  "license_note": "Licences are as stated by each repository's licence file at the pinned commit. The corpus is fetched for local analysis and is not redistributed with this repository."
+}

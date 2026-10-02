@@ -23,6 +23,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vulnerability.hpp"
@@ -66,13 +67,20 @@ public:
 
     constexpr std::uint32_t raw() const noexcept { return bits_; }
 
+    constexpr bool operator==(const SanitizerMask&) const noexcept = default;
+
 private:
     static constexpr std::uint32_t bit_for(VulnClass id) noexcept {
-        return std::uint32_t{1} << (static_cast<std::uint8_t>(id) & 31u);
+        return std::uint32_t{1} << (std::to_underlying(id) & 31u);
     }
 
     std::uint32_t bits_ = 0;
 };
+
+// The same bitmask read without the "was cleaned" meaning: just a set of
+// classes. Function summaries use it to say which classes a value is still
+// dangerous for when it leaves a function.
+using ClassSet = SanitizerMask;
 
 // Everything known about one tainted value.
 struct TaintFact {
@@ -80,6 +88,7 @@ struct TaintFact {
     std::vector<TaintStep> trace;   // ordered source -> current position
     SanitizerMask sanitized;        // classes this value is no longer dangerous for
     int depth = 0;                  // propagation hops; used to bound the fixpoint
+    bool local = false;             // entered from argv/env/stdin, not a remote request
 
     // True when this value can still cause `id`.
     bool dangerous_for(VulnClass id) const noexcept { return !sanitized.covers(id); }

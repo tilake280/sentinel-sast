@@ -25,12 +25,13 @@
 #include <vector>
 
 #include "analyzer.hpp"
+#include "version.hpp"
 
 namespace sentinel {
 
 struct SarifOptions {
     std::string tool_name = "Sentinel SAST";
-    std::string tool_version = "0.2.0";
+    std::string tool_version = std::string(kVersion);
     std::string information_uri = "https://github.com/sentinel-sast";
     std::string repository;
     std::string commit;

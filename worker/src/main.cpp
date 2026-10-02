@@ -22,23 +22,32 @@
 
 #include <atomic>
 #include <chrono>
+#include <algorithm>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <optional>
+#include <ranges>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "analyzer.hpp"
+#include "job.hpp"
 #include "sarif.hpp"
 #include "triage_client.hpp"
+#include "version.hpp"
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -81,12 +90,13 @@ int env_int(const char* key, int fallback) {
     }
 }
 
-enum class OutputFormat { Text, Sarif, Line, Json };
+enum class OutputFormat { Text, Sarif, Line, Json, Report };
 
 struct Options {
     bool worker_mode = true;
     std::string scan_path;
     OutputFormat format = OutputFormat::Text;
+    std::vector<std::string> excludes;
     std::string output_file;
     sentinel::Severity fail_on = sentinel::Severity::Info;
     bool fail_on_set = false;
@@ -98,7 +108,7 @@ struct Options {
     bool no_color = false;
 };
 
-constexpr std::string_view kVersion = "0.2.0";
+using sentinel::kVersion;
 
 void print_help() {
     std::cout << R"(Sentinel SAST analysis worker
@@ -110,7 +120,13 @@ USAGE
 
 SCAN OPTIONS
   --scan <path>          File or directory to analyse
-  --format <fmt>         text (default), sarif, line, json
+  --format <fmt>         text (default), sarif, line, json, report
+                         report is the full scan result: every finding with its
+                         triage verdict (suppressed ones included), per-file
+                         records and totals
+  --exclude <pattern>    Skip a directory or file by name, or files by suffix
+                         when the pattern starts with '*' (e.g. '*.min.js').
+                         Repeatable
   --output <file>        Write the report to a file instead of stdout
   --fail-on <severity>   Exit non-zero if any finding is at or above this level
                          (info, low, medium, high, critical)
@@ -124,7 +140,8 @@ GENERAL
 
 ENVIRONMENT
   RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_USER, RABBITMQ_PASSWORD
-  SCAN_QUEUE             Queue name (default: scan_jobs)
+  SCAN_QUEUE             Queue to consume jobs from (default: scan_jobs)
+  RESULTS_QUEUE          Queue finished scans are published to (default: scan_results)
   TRIAGE_URL             AI triage endpoint (default: http://localhost:8000/api/v1/triage)
 
 EXIT CODES
@@ -134,15 +151,13 @@ EXIT CODES
 )";
 }
 
-sentinel::Severity parse_severity(std::string_view value, bool& ok) {
-    ok = true;
+std::expected<sentinel::Severity, std::string> parse_severity(std::string_view value) {
     if (value == "info") return sentinel::Severity::Info;
     if (value == "low") return sentinel::Severity::Low;
     if (value == "medium") return sentinel::Severity::Medium;
     if (value == "high") return sentinel::Severity::High;
     if (value == "critical") return sentinel::Severity::Critical;
-    ok = false;
-    return sentinel::Severity::Info;
+    return std::unexpected(std::format("unknown severity '{}'", value));
 }
 
 // Returns false when parsing failed; the error is already printed.
@@ -191,20 +206,26 @@ bool parse_arguments(int argc, char** argv, Options& options) {
                 options.format = OutputFormat::Line;
             } else if (format == "json") {
                 options.format = OutputFormat::Json;
+            } else if (format == "report") {
+                options.format = OutputFormat::Report;
             } else {
                 std::cerr << std::format("[worker] unknown format '{}'\n", format);
                 return false;
             }
+        } else if (argument == "--exclude") {
+            const char* value = next("--exclude");
+            if (value == nullptr) return false;
+            options.excludes.emplace_back(value);
         } else if (argument == "--fail-on") {
             const char* value = next("--fail-on");
             if (value == nullptr) return false;
-            bool ok = false;
-            options.fail_on = parse_severity(value, ok);
-            options.fail_on_set = true;
-            if (!ok) {
-                std::cerr << std::format("[worker] unknown severity '{}'\n", value);
+            const auto severity = parse_severity(value);
+            if (!severity) {
+                std::cerr << std::format("[worker] {}\n", severity.error());
                 return false;
             }
+            options.fail_on = *severity;
+            options.fail_on_set = true;
         } else {
             std::cerr << std::format("[worker] unknown argument '{}'\n", argument);
             return false;
@@ -240,7 +261,46 @@ void print_rules() {
         std::cout << std::format("    {:<28} {:<10} {}\n", meta.name, meta.cwe,
                                  sentinel::to_string(meta.baseline));
     }
+
+    // Read off the rule tables rather than written by hand, so the coverage a
+    // README claims can be checked against the binary that ships.
+    std::cout << "\n  Coverage by language"
+                 " (taint = source reaching a sink, pattern = no dataflow needed):\n";
+    std::cout << std::format("    {:<28}", "");
+    for (const auto language : sentinel::supported_languages()) {
+        std::cout << std::format(" {:<14}", sentinel::to_string(language));
+    }
     std::cout << "\n";
+
+    std::vector<std::vector<sentinel::ClassCoverage>> columns;
+    for (const auto language : sentinel::supported_languages()) {
+        const auto* spec = sentinel::spec_for(language);
+        columns.push_back(spec != nullptr ? sentinel::class_coverage(*spec)
+                                          : std::vector<sentinel::ClassCoverage>{});
+    }
+
+    std::vector<std::size_t> detected(columns.size(), 0);
+    for (const auto& meta : sentinel::all_vulnerability_classes()) {
+        if (meta.id == sentinel::VulnClass::Unknown) continue;
+        std::cout << std::format("    {:<28}", meta.name);
+
+        for (const auto& [index, column] : std::views::enumerate(columns)) {
+            const auto entry = std::ranges::find(column, meta.id, &sentinel::ClassCoverage::id);
+            std::string_view how = "-";
+            if (entry != column.end() && entry->detected()) {
+                ++detected[static_cast<std::size_t>(index)];
+                how = entry->by_taint && entry->by_pattern ? "taint+pattern"
+                      : entry->by_taint                    ? "taint"
+                                                           : "pattern";
+            }
+            std::cout << std::format(" {:<14}", how);
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << std::format("    {:<28}", "classes detected");
+    for (const std::size_t count : detected) std::cout << std::format(" {:<14}", count);
+    std::cout << "\n\n";
 }
 
 // ---- Local scanning -------------------------------------------------------
@@ -253,30 +313,38 @@ bool is_excluded_directory(const std::string& name) {
         "build",        "target", "__pycache__", ".venv",   "venv",
         ".next",        "coverage", ".mypy_cache", ".pytest_cache",
     };
-    return std::find(kExcluded.begin(), kExcluded.end(), name) != kExcluded.end();
+    return std::ranges::contains(kExcluded, name);
 }
 
-std::string read_file(const fs::path& path, bool& ok) {
+std::expected<std::string, std::error_code> read_file(const fs::path& path) {
+    errno = 0;
     std::ifstream stream(path, std::ios::binary);
     if (!stream) {
-        ok = false;
-        return {};
+        // iostreams do not report why an open failed; errno is the only place
+        // the reason survives, and it is worth a line in the scan log.
+        return std::unexpected(std::error_code(errno != 0 ? errno : EIO, std::generic_category()));
     }
     std::ostringstream buffer;
     buffer << stream.rdbuf();
-    ok = true;
     return buffer.str();
 }
 
-std::vector<fs::path> collect_scan_targets(const fs::path& root, bool& ok) {
+// True when a --exclude pattern covers this file or directory name. A pattern
+// beginning with '*' matches by suffix; anything else must equal the name.
+bool is_excluded_by_user(const std::string& name, const std::vector<std::string>& patterns) {
+    return std::ranges::any_of(patterns, [&](const std::string& pattern) {
+        if (pattern.starts_with('*')) return name.ends_with(std::string_view(pattern).substr(1));
+        return name == pattern;
+    });
+}
+
+std::expected<std::vector<fs::path>, std::string> collect_scan_targets(
+    const fs::path& root, const std::vector<std::string>& excludes) {
     std::vector<fs::path> targets;
-    ok = true;
 
     std::error_code error;
     if (!fs::exists(root, error)) {
-        std::cerr << std::format("[worker] path does not exist: {}\n", root.string());
-        ok = false;
-        return targets;
+        return std::unexpected(std::format("path does not exist: {}", root.string()));
     }
 
     if (fs::is_regular_file(root, error)) {
@@ -289,10 +357,7 @@ std::vector<fs::path> collect_scan_targets(const fs::path& root, bool& ok) {
     fs::recursive_directory_iterator it(
         root, fs::directory_options::skip_permission_denied, error);
     if (error) {
-        std::cerr << std::format("[worker] cannot walk {}: {}\n", root.string(),
-                                 error.message());
-        ok = false;
-        return targets;
+        return std::unexpected(std::format("cannot walk {}: {}", root.string(), error.message()));
     }
 
     for (fs::recursive_directory_iterator end; it != end; it.increment(error)) {
@@ -302,8 +367,10 @@ std::vector<fs::path> collect_scan_targets(const fs::path& root, bool& ok) {
         }
         const fs::path& path = it->path();
 
+        const std::string name = path.filename().string();
+
         if (it->is_directory(error)) {
-            if (is_excluded_directory(path.filename().string())) {
+            if (is_excluded_directory(name) || is_excluded_by_user(name, excludes)) {
                 it.disable_recursion_pending();
             }
             continue;
@@ -311,6 +378,7 @@ std::vector<fs::path> collect_scan_targets(const fs::path& root, bool& ok) {
 
         if (!it->is_regular_file(error)) continue;
         if (sentinel::language_for_path(path.string()) == sentinel::Language::Unknown) continue;
+        if (is_excluded_by_user(name, excludes)) continue;
         targets.push_back(path);
     }
 
@@ -321,28 +389,36 @@ std::vector<fs::path> collect_scan_targets(const fs::path& root, bool& ok) {
 int run_local_scan(const Options& options) {
     const fs::path root(options.scan_path);
 
-    bool ok = false;
-    const auto targets = collect_scan_targets(root, ok);
-    if (!ok) return 2;
+    const auto targets = collect_scan_targets(root, options.excludes);
+    if (!targets) {
+        std::cerr << std::format("[worker] {}\n", targets.error());
+        return 2;
+    }
 
     if (!options.quiet) {
-        std::cerr << std::format("[scan] {} file(s) under {}\n", targets.size(), root.string());
+        std::cerr << std::format("[scan] {} file(s) under {}\n", targets->size(), root.string());
     }
 
     std::vector<sentinel::Finding> all_findings;
-    sentinel::ScanSummary summary;
 
-    for (const auto& path : targets) {
+    // Built alongside the findings for --format report, which keeps what the
+    // other formats drop: the suppressed findings, and a record per file.
+    sentinel::ScanResult result;
+    result.job_id = "local";
+    result.repository = root.string();
+    sentinel::ScanSummary& summary = result.summary;
+
+    for (const auto& path : *targets) {
         if (g_shutdown_requested.load()) {
             std::cerr << "[scan] interrupted\n";
             break;
         }
 
-        bool read_ok = false;
-        const std::string content = read_file(path, read_ok);
-        if (!read_ok) {
+        const auto content = read_file(path);
+        if (!content) {
             if (!options.quiet) {
-                std::cerr << std::format("[scan] skipping unreadable file: {}\n", path.string());
+                std::cerr << std::format("[scan] skipping unreadable file: {} ({})\n",
+                                         path.string(), content.error().message());
             }
             continue;
         }
@@ -355,8 +431,8 @@ int run_local_scan(const Options& options) {
         if (relative_error) display = path;
 
         const auto report =
-            sentinel::analyze_file_detailed("local", {display.string(), content});
-        summary.absorb(report);
+            sentinel::analyze_file_detailed("local", {display.string(), *content});
+        result.absorb(report);
 
         for (const auto& finding : report.findings) {
             all_findings.push_back(finding);
@@ -382,6 +458,18 @@ int run_local_scan(const Options& options) {
 
         for (auto& finding : all_findings) {
             const auto verdict = triage.triage(finding);
+
+            sentinel::TriagedFinding& triaged = result.findings.emplace_back();
+            triaged.finding = finding;
+            if (verdict.ok) {
+                triaged.verdict = verdict.suppress ? sentinel::Verdict::Suppressed
+                                                   : sentinel::Verdict::Escalated;
+                triaged.triage_confidence = verdict.confidence;
+                triaged.triage_reason = verdict.reason;
+            } else {
+                triaged.triage_reason = std::format("triage unavailable: {}", verdict.error);
+            }
+
             if (verdict.ok && verdict.suppress) {
                 ++suppressed_by_ai;
                 continue;
@@ -393,6 +481,12 @@ int run_local_scan(const Options& options) {
             std::cerr << "[scan] triage layer unreachable; all findings escalated\n";
         }
         all_findings = std::move(kept);
+    } else {
+        for (const auto& finding : all_findings) {
+            sentinel::TriagedFinding& triaged = result.findings.emplace_back();
+            triaged.finding = finding;
+            triaged.triage_reason = "triage disabled for this scan";
+        }
     }
 
     // Render.
@@ -434,6 +528,9 @@ int run_local_scan(const Options& options) {
             rendered = out.dump(2);
             break;
         }
+        case OutputFormat::Report:
+            rendered = sentinel::to_json(result, 2);
+            break;
     }
 
     if (options.output_file.empty()) {
@@ -455,10 +552,10 @@ int run_local_scan(const Options& options) {
             "\n[scan] {} file(s), {} finding(s) in {:.1f}ms"
             " — {} critical, {} high, {} medium, {} low\n",
             summary.files_scanned, all_findings.size(), summary.total_ms,
-            summary.by_severity[static_cast<int>(sentinel::Severity::Critical)],
-            summary.by_severity[static_cast<int>(sentinel::Severity::High)],
-            summary.by_severity[static_cast<int>(sentinel::Severity::Medium)],
-            summary.by_severity[static_cast<int>(sentinel::Severity::Low)]);
+            summary.by_severity[std::to_underlying(sentinel::Severity::Critical)],
+            summary.by_severity[std::to_underlying(sentinel::Severity::High)],
+            summary.by_severity[std::to_underlying(sentinel::Severity::Medium)],
+            summary.by_severity[std::to_underlying(sentinel::Severity::Low)]);
 
         if (summary.suppressed_inline > 0) {
             std::cerr << std::format("[scan] {} suppressed by inline directives\n",
@@ -471,12 +568,16 @@ int run_local_scan(const Options& options) {
             std::cerr << std::format("[scan] {} file(s) had parse errors\n",
                                      summary.files_with_parse_errors);
         }
+        if (summary.files_minified > 0) {
+            std::cerr << std::format("[scan] {} minified file(s) skipped\n",
+                                     summary.files_minified);
+        }
     }
 
     // CI gate.
     if (options.fail_on_set) {
         for (const auto& finding : all_findings) {
-            if (static_cast<int>(finding.severity) >= static_cast<int>(options.fail_on)) {
+            if (finding.severity >= options.fail_on) {
                 if (!options.quiet) {
                     std::cerr << std::format("[scan] failing: {} finding at or above {}\n",
                                              to_string(finding.severity),
@@ -511,39 +612,44 @@ bool check_reply(const amqp_rpc_reply_t& reply, std::string_view context) {
     return false;
 }
 
-void process_job(const std::string& body, sentinel::TriageClient& triage, bool use_triage) {
-    json job;
-    try {
-        job = json::parse(body);
-    } catch (const json::exception& e) {
-        std::cerr << std::format("[worker] skipping malformed job: {}\n", e.what());
-        return;
-    }
-
-    const std::string repository = job.value("repository", "unknown/repo");
-    const std::string job_id = job.value("job_id", "-");
+// Scans one job and returns everything a consumer of the result needs: each
+// finding with the verdict it was given, and the totals. The log lines are the
+// same ones the worker has always printed; the result is the same information
+// in a form that can leave the process.
+sentinel::ScanResult process_job(const sentinel::ScanJob& job, sentinel::TriageClient& triage,
+                                 bool use_triage) {
+    const std::string& repository = job.repository;
+    const std::string& job_id = job.job_id;
     std::cout << std::format("\n[worker] job {} for {}\n", job_id, repository);
 
-    std::vector<sentinel::SourceFile> files;
-    for (const auto& entry : job.value("files", json::array())) {
-        files.push_back({entry.value("path", "unknown"), entry.value("content", "")});
-    }
+    sentinel::ScanResult result;
+    result.job_id = job.job_id;
+    result.repository = job.repository;
+    result.commit = job.commit;
+
+    const std::vector<sentinel::SourceFile>& files = job.files;
     if (files.empty()) {
+        // Still a result: an empty scan that completed, so whoever queued it
+        // is not left waiting on a job that will never report back.
         std::cout << "[worker] job contained no files\n";
-        return;
+        return result;
     }
 
-    sentinel::ScanSummary summary;
+    sentinel::ScanSummary& summary = result.summary;
     std::size_t suppressed = 0;
     std::size_t escalated = 0;
     std::size_t triage_failures = 0;
 
     for (const auto& file : files) {
         const auto report = sentinel::analyze_file_detailed(repository, file);
-        summary.absorb(report);
+        result.absorb(report);
 
         if (!report.language_supported) {
             std::cout << std::format("[worker] skipping unsupported file: {}\n", file.path);
+            continue;
+        }
+        if (report.skipped_minified) {
+            std::cout << std::format("[worker] skipping minified file: {}\n", file.path);
             continue;
         }
 
@@ -570,8 +676,15 @@ void process_job(const std::string& body, sentinel::TriageClient& triage, bool u
                 }
             }
 
+            sentinel::TriagedFinding& triaged = result.findings.emplace_back();
+            triaged.finding = finding;
+
+            // No verdict, for either reason below, is recorded as Untriaged.
+            // The finding is still shown -- that is the fail-open rule -- and
+            // the log still counts it as escalated, as it always has.
             if (!use_triage) {
                 ++escalated;
+                triaged.triage_reason = "triage disabled for this worker";
                 continue;
             }
 
@@ -579,17 +692,23 @@ void process_job(const std::string& body, sentinel::TriageClient& triage, bool u
             if (!verdict.ok) {
                 ++triage_failures;
                 ++escalated;
+                triaged.triage_reason = std::format("triage unavailable: {}", verdict.error);
                 std::cerr << std::format("[worker]     TRIAGE FAILED: {} (escalating)\n",
                                          verdict.error);
                 continue;
             }
 
+            triaged.triage_confidence = verdict.confidence;
+            triaged.triage_reason = verdict.reason;
+
             if (verdict.suppress) {
                 ++suppressed;
+                triaged.verdict = sentinel::Verdict::Suppressed;
                 std::cout << std::format("[worker]     SUPPRESSED ({:.4f}) {}\n",
                                          verdict.confidence, verdict.reason);
             } else {
                 ++escalated;
+                triaged.verdict = sentinel::Verdict::Escalated;
                 std::cout << std::format("[worker]     ESCALATED ({:.4f}) {}\n",
                                          verdict.confidence, verdict.reason);
             }
@@ -607,6 +726,32 @@ void process_job(const std::string& body, sentinel::TriageClient& triage, bool u
         std::cout << std::format(", {} triage failure(s)", triage_failures);
     }
     std::cout << "\n";
+
+    return result;
+}
+
+// Publishes a finished scan to the results queue. Persistent, so a result
+// survives a broker restart the same way a job does.
+std::expected<void, std::string> publish_result(amqp_connection_state_t conn,
+                                                const std::string& queue,
+                                                const sentinel::ScanResult& result) {
+    const std::string body = sentinel::to_json(result);
+
+    amqp_basic_properties_t properties{};
+    properties._flags = AMQP_BASIC_CONTENT_TYPE_FLAG | AMQP_BASIC_DELIVERY_MODE_FLAG;
+    properties.content_type = amqp_cstring_bytes("application/json");
+    properties.delivery_mode = 2;
+
+    amqp_bytes_t payload;
+    payload.len = body.size();
+    payload.bytes = const_cast<char*>(body.data());
+
+    // The default exchange routes by queue name, which is all this needs.
+    const int status = amqp_basic_publish(conn, 1, amqp_empty_bytes,
+                                          amqp_cstring_bytes(queue.c_str()), 0, 0, &properties,
+                                          payload);
+    if (status != AMQP_STATUS_OK) return std::unexpected(amqp_error_string2(status));
+    return {};
 }
 
 // Returns 0 on a clean shutdown, 2 on a connection error.
@@ -616,6 +761,7 @@ int run_worker(const Options& options) {
     const std::string user = env_or("RABBITMQ_USER", "guest");
     const std::string password = env_or("RABBITMQ_PASSWORD", "guest");
     const std::string queue_name = env_or("SCAN_QUEUE", "scan_jobs");
+    const std::string results_queue = env_or("RESULTS_QUEUE", "scan_results");
 
     sentinel::TriageConfig triage_config;
     triage_config.endpoint = env_or("TRIAGE_URL", "http://localhost:8000/api/v1/triage");
@@ -626,6 +772,7 @@ int run_worker(const Options& options) {
                              sentinel::total_rule_count(),
                              sentinel::all_vulnerability_classes().size() - 1);
     std::cout << std::format("[worker] queue    : {} @ {}:{}\n", queue_name, host, port);
+    std::cout << std::format("[worker] results  : {}\n", results_queue);
     std::cout << std::format("[worker] triage   : {}{}\n", triage_config.endpoint,
                              options.use_triage ? "" : " (disabled)");
 
@@ -685,6 +832,16 @@ int run_worker(const Options& options) {
             return 2;
         }
 
+        // Where finished scans go. Declared here as well as by the consumer so
+        // a result published before the gateway has ever started is queued
+        // rather than dropped as unroutable.
+        amqp_queue_declare(conn, 1, amqp_cstring_bytes(results_queue.c_str()), 0, 1, 0, 0,
+                           amqp_empty_table);
+        if (!check_reply(amqp_get_rpc_reply(conn), "results queue declare")) {
+            teardown();
+            return 2;
+        }
+
         // One unacked message at a time, so work spreads across workers.
         amqp_basic_qos(conn, 1, 0, 1, 0);
         if (!check_reply(amqp_get_rpc_reply(conn), "basic qos")) {
@@ -729,12 +886,42 @@ int run_worker(const Options& options) {
             const std::string body(static_cast<char*>(envelope.message.body.bytes),
                                    envelope.message.body.len);
 
-            try {
-                process_job(body, triage, options.use_triage);
-            } catch (const std::exception& e) {
-                // A single bad job must not take down the worker. Ack it so it
-                // is not redelivered forever into the same crash.
-                std::cerr << std::format("[worker] job failed: {}\n", e.what());
+            // The result to publish, when there is one. A malformed job has no
+            // id to report against, so it yields nothing.
+            std::optional<sentinel::ScanResult> result;
+
+            if (const auto job = sentinel::parse_job(body)) {
+                try {
+                    result = process_job(*job, triage, options.use_triage);
+                } catch (const std::exception& e) {
+                    // A single bad job must not take down the worker. It is
+                    // acked below so it is not redelivered forever into the
+                    // same crash, and reported as failed so the scan it
+                    // belongs to does not sit pending.
+                    std::cerr << std::format("[worker] job failed: {}\n", e.what());
+                    result.emplace();
+                    result->job_id = job->job_id;
+                    result->repository = job->repository;
+                    result->commit = job->commit;
+                    result->failed = true;
+                    result->error = e.what();
+                }
+            } else {
+                std::cerr << std::format("[worker] skipping malformed job: {}\n", job.error());
+            }
+
+            if (result) {
+                if (const auto published = publish_result(conn, results_queue, *result);
+                    !published) {
+                    // Without the ack the broker redelivers the job, so the
+                    // scan is redone rather than its result being lost. A
+                    // failed publish means the connection is gone anyway.
+                    std::cerr << std::format(
+                        "[worker] could not publish result for job {}: {}; reconnecting\n",
+                        result->job_id, published.error());
+                    amqp_destroy_envelope(&envelope);
+                    break;
+                }
             }
 
             amqp_basic_ack(conn, 1, envelope.delivery_tag, 0);

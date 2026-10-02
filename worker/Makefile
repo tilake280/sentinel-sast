@@ -31,8 +31,12 @@ all: $(BIN)
 $(BIN): $(OBJ) $(TS_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
 
+# -MMD -MP writes a .d file beside each object listing the headers it included,
+# so editing a header rebuilds every source that depends on it.
 build/%.o: src/%.cpp | build
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+-include $(OBJ:.o=.d)
 
 # One compile rule per vendored C file, each with its own grammar src on the
 # include path (parser.c includes "tree_sitter/parser.h" from beside itself).
@@ -44,10 +48,12 @@ $(foreach s,$(TS_SRCS),$(eval $(call TS_COMPILE_RULE,$(s))))
 
 # Every source except main.cpp and triage_client.cpp, which pull in RabbitMQ and
 # curl. Keeping the analysis core free of I/O dependencies is what lets the test
-# suite run with no broker and no database.
+# suite run with no broker and no database. job.cpp parses queue messages but
+# never touches the queue, so it belongs on this side of the line.
 ENGINE_SRC := src/analyzer.cpp src/languages.cpp src/ast.cpp src/taint.cpp \
               src/types.cpp src/sanitizers.cpp src/interproc.cpp src/secrets.cpp \
-              src/suppress.cpp src/severity.cpp src/vulnerability.cpp src/sarif.cpp
+              src/suppress.cpp src/severity.cpp src/vulnerability.cpp src/sarif.cpp \
+              src/job.cpp
 
 test: $(TS_OBJS) | build
 	$(CXX) $(CXXFLAGS) -o build/test_analyzer tests/test_analyzer.cpp \

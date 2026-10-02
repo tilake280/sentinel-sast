@@ -6,14 +6,21 @@
 // dependencies, which is the property that makes this suite runnable anywhere.
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
+#include <initializer_list>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../src/analyzer.hpp"
+#include "../src/interproc.hpp"
+#include "../src/job.hpp"
 #include "../src/sarif.hpp"
 #include "../src/secrets.hpp"
 #include "../src/suppress.hpp"
+#include "../src/version.hpp"
 #include "harness.hpp"
 
 using namespace sentinel;
@@ -839,6 +846,37 @@ void robustness_suite() {
         const auto findings = analyze("src/e5.js", deep);
         harness::check(!findings.empty(), "deeply nested file is analysed without a crash",
                        "expected the finding at the bottom of 500 nested blocks");
+    }
+
+    // Minified bundles are build output: skipped, and reported as skipped.
+    {
+        // 12 KB on two lines, with a real source-to-sink flow in it.
+        std::string bundle = "var db=mysql.createConnection({});";
+        while (bundle.size() < 12 * 1024) bundle += "function f(a){return a+1}var q=f(2);";
+        bundle += "\ndb.query('SELECT '+req.query.n);\n";
+        harness::check(looks_minified(bundle), "minified: a bundle on two lines is recognised");
+
+        const FileReport report = scan("public/js/app.min.js", bundle);
+        harness::check(report.skipped_minified && !report.parsed && report.findings.empty(),
+                       "minified: the bundle is skipped, with no findings");
+
+        ScanSummary summary;
+        summary.absorb(report);
+        harness::check(summary.files_minified == 1 && summary.files_scanned == 0,
+                       "minified: counted as skipped, not as scanned");
+
+        // The same code laid out normally is analysed as usual.
+        std::string readable = "const db = mysql.createConnection({});\n";
+        for (int i = 0; i < 400; ++i) readable += "function f" + std::to_string(i) + "(a) {\n  return a + 1;\n}\n";
+        readable += "db.query('SELECT ' + req.query.n);\n";
+        harness::check(!looks_minified(readable) && readable.size() > 12 * 1024,
+                       "minified: ordinary code of the same size is not");
+        harness::check(!analyze("src/big.js", readable).empty(),
+                       "minified: and its findings are still reported");
+
+        // One long line in a small file is not a bundle.
+        harness::check(!looks_minified(std::string(3000, 'x') + "\nshort\n"),
+                       "minified: a small file with one long line is not");
     }
 
     // Long lines are truncated rather than flooding the report.
@@ -1897,6 +1935,1136 @@ void scan_summary_suite() {
                    "summary: buckets findings by severity");
 }
 
+// ---------------------------------------------------------------------------
+// Class x language matrix.
+//
+// The claim this backs is "N vulnerability classes across JavaScript, Python
+// and Go". Each cell is one canonical vulnerable line, run three ways:
+//
+//   live      the line as code                 -> must be reported, on that line
+//   comment   the same line commented out      -> must produce nothing
+//   string    the same text inside a literal   -> must produce nothing
+//
+// The second and third are what separate matching the syntax tree from
+// matching text: the characters are identical in all three.
+// ---------------------------------------------------------------------------
+
+struct MatrixCell {
+    VulnClass id;
+    std::string_view path;    // extension selects the language
+    std::string prefix;       // setup; must not contain a sink itself
+    std::string sink;         // the one line that must be reported
+    std::string suffix;
+};
+
+std::string as_string_literal(std::string_view text) {
+    std::string out = "\"";
+    for (const char c : text) {
+        if (c == '\\' || c == '"') out += '\\';
+        out += c;
+    }
+    return out + "\"";
+}
+
+std::string_view matrix_language(std::string_view path) {
+    if (path.ends_with(".js")) return "js";
+    if (path.ends_with(".py")) return "py";
+    return "go";
+}
+
+void check_matrix_cell(const MatrixCell& cell) {
+    const std::string_view language = matrix_language(cell.path);
+    const std::string_view name = metadata_for(cell.id).name;
+    const std::string path(cell.path);
+
+    const int sink_line =
+        1 + static_cast<int>(std::ranges::count(cell.prefix, '\n'));
+    const std::string_view sink_text = std::string_view(cell.sink).substr(
+        cell.sink.find_first_not_of(' '));
+    const std::string indent = cell.sink.substr(0, cell.sink.size() - sink_text.size());
+
+    expect_finding(std::format("{} / {}: live code is reported", language, name), path,
+                   cell.prefix + cell.sink + "\n" + cell.suffix, cell.id, sink_line);
+
+    const std::string_view marker = language == "py" ? "# " : "// ";
+    expect_none(std::format("{} / {}: commented out is silent", language, name), path,
+                cell.prefix + indent + std::string(marker) + std::string(sink_text) + "\n" +
+                    cell.suffix);
+
+    const std::string literal = as_string_literal(sink_text);
+    std::string statement;
+    if (language == "js") {
+        statement = "const note = " + literal + ";";
+    } else if (language == "py") {
+        statement = "note = " + literal;
+    } else {
+        statement = "note := " + literal;
+    }
+    expect_none(std::format("{} / {}: inside a string literal is silent", language, name), path,
+                cell.prefix + indent + statement + "\n" + cell.suffix);
+}
+
+void class_matrix_suite() {
+    harness::section("Class x language matrix (live / comment / string)");
+
+    const std::string go_open = "package main\nfunc h(w http.ResponseWriter, r *http.Request) {\n";
+    const std::string go_close = "}\n";
+
+    const std::vector<MatrixCell> cells = {
+        // ---- JavaScript ----------------------------------------------------
+        {VulnClass::SqlInjection, "m/sql.js", "const db = mysql.createConnection({});\n",
+         "db.query('SELECT * FROM users WHERE id = ' + req.query.id);", ""},
+        {VulnClass::CommandInjection, "m/cmd.js", "const cp = require('child_process');\n",
+         "cp.exec('ping -c 1 ' + req.query.host);", ""},
+        {VulnClass::CrossSiteScripting, "m/xss.js",
+         "const out = document.getElementById('out');\n",
+         "out.innerHTML = req.query.name;", ""},
+        {VulnClass::PathTraversal, "m/path.js", "const fs = require('fs');\n",
+         "fs.readFileSync('/srv/data/' + req.query.file);", ""},
+        {VulnClass::ServerSideRequestForgery, "m/ssrf.js", "", "fetch(req.query.url);", ""},
+        {VulnClass::RemoteCodeExecution, "m/rce.js", "", "eval(req.body.expression);", ""},
+        {VulnClass::OpenRedirect, "m/redirect.js", "app.get('/go', (req, res) => {\n",
+         "  res.redirect(req.query.next);", "});\n"},
+        {VulnClass::InsecureDeserialization, "m/deser.js",
+         "const serialize = require('node-serialize');\n",
+         "serialize.unserialize(req.body.profile);", ""},
+
+        // ---- Python --------------------------------------------------------
+        {VulnClass::SqlInjection, "m/sql.py", "cursor = conn.cursor()\n",
+         "cursor.execute(\"SELECT * FROM users WHERE id = \" + request.args['id'])", ""},
+        {VulnClass::CommandInjection, "m/cmd.py", "import os\n",
+         "os.system('ping -c 1 ' + request.args['host'])", ""},
+        {VulnClass::CrossSiteScripting, "m/xss.py", "from markupsafe import Markup\n",
+         "Markup('<b>' + request.args['name'] + '</b>')", ""},
+        {VulnClass::PathTraversal, "m/path.py", "",
+         "open('/srv/data/' + request.args['file'])", ""},
+        {VulnClass::ServerSideRequestForgery, "m/ssrf.py", "import requests\n",
+         "requests.get(request.args['url'])", ""},
+        {VulnClass::RemoteCodeExecution, "m/rce.py", "", "eval(request.args['expression'])", ""},
+        {VulnClass::OpenRedirect, "m/redirect.py", "from flask import redirect\n",
+         "redirect(request.args['next'])", ""},
+        {VulnClass::InsecureDeserialization, "m/deser.py", "import pickle\n",
+         "pickle.loads(request.data)", ""},
+
+        // ---- Go ------------------------------------------------------------
+        {VulnClass::SqlInjection, "m/sql.go", go_open,
+         "  db.Query(\"SELECT * FROM users WHERE name = '\" + r.FormValue(\"name\") + \"'\")",
+         go_close},
+        {VulnClass::CommandInjection, "m/cmd.go", go_open,
+         "  exec.Command(\"sh\", \"-c\", r.FormValue(\"cmd\"))", go_close},
+        {VulnClass::CrossSiteScripting, "m/xss.go", go_open,
+         "  fmt.Fprintf(w, \"<h1>Hello %s</h1>\", r.FormValue(\"name\"))", go_close},
+        {VulnClass::PathTraversal, "m/path.go", go_open,
+         "  os.Open(\"/srv/data/\" + r.FormValue(\"file\"))", go_close},
+        {VulnClass::ServerSideRequestForgery, "m/ssrf.go", go_open,
+         "  http.Get(r.FormValue(\"url\"))", go_close},
+        {VulnClass::RemoteCodeExecution, "m/rce.go", go_open,
+         "  template.New(\"page\").Parse(r.FormValue(\"tpl\"))", go_close},
+        {VulnClass::OpenRedirect, "m/redirect.go", go_open,
+         "  http.Redirect(w, r, r.FormValue(\"next\"), http.StatusFound)", go_close},
+        {VulnClass::InsecureDeserialization, "m/deser.go", go_open,
+         "  gob.NewDecoder(r.Body).Decode(&session)", go_close},
+    };
+
+    for (const auto& cell : cells) check_matrix_cell(cell);
+}
+
+// Go names things generically -- Write, Parse, Run, Unmarshal, Open -- so a
+// rule keyed on the method name alone reports most of the standard library.
+// These pin down both halves of each strict rule: it fires on the dangerous
+// receiver and stays quiet on the look-alikes.
+void go_receiver_precision_suite() {
+    harness::section("Go: strict receiver guards");
+
+    const auto handler = [](const std::string& body) {
+        return "package main\nfunc h(w http.ResponseWriter, r *http.Request) {\n" + body + "}\n";
+    };
+
+    // ---- XSS: the writer has to be the response ----------------------------
+    expect_finding("go xss: w.Write on a ResponseWriter parameter", "g/x1.go",
+                   handler("  w.Write([]byte(\"<p>\" + r.FormValue(\"q\") + \"</p>\"))\n"),
+                   VulnClass::CrossSiteScripting, 3);
+    expect_finding("go xss: tainted Fprintf format string", "g/x2.go",
+                   handler("  fmt.Fprintf(w, r.FormValue(\"q\"))\n"),
+                   VulnClass::CrossSiteScripting, 3);
+    expect_finding("go xss: io.WriteString to the response", "g/x3.go",
+                   handler("  io.WriteString(w, r.FormValue(\"q\"))\n"),
+                   VulnClass::CrossSiteScripting, 3);
+    expect_confidence("go xss: a typed parameter resolves the receiver", "g/x4.go",
+                      handler("  w.Write([]byte(r.FormValue(\"q\")))\n"),
+                      VulnClass::CrossSiteScripting, Confidence::High);
+
+    expect_not_class("go xss: Fprintf to stderr is not HTML output", "g/x5.go",
+                     handler("  fmt.Fprintf(os.Stderr, \"bad input: %s\\n\", r.FormValue(\"q\"))\n"),
+                     VulnClass::CrossSiteScripting);
+    expect_not_class("go xss: writing to a hash is not HTML output", "g/x6.go",
+                     handler("  digest := sha256.New()\n"
+                             "  digest.Write([]byte(r.FormValue(\"q\")))\n"),
+                     VulnClass::CrossSiteScripting);
+    expect_not_class("go xss: writing to an io.Writer parameter is not HTML output", "g/x7.go",
+                     "package main\n"
+                     "func dump(out io.Writer, r *http.Request) {\n"
+                     "  out.Write([]byte(r.FormValue(\"q\")))\n"
+                     "}\n",
+                     VulnClass::CrossSiteScripting);
+    expect_not_class("go xss: Fprintf of constants to the response", "g/x8.go",
+                     handler("  fmt.Fprintf(w, \"<p>%d items</p>\", 3)\n"),
+                     VulnClass::CrossSiteScripting);
+
+    // Grouped names share one declared type.
+    expect_class("go types: grouped parameters both take the declared type", "g/x9.go",
+                 "package main\n"
+                 "func copyTo(primary, mirror http.ResponseWriter, r *http.Request) {\n"
+                 "  mirror.Write([]byte(r.FormValue(\"q\")))\n"
+                 "}\n",
+                 VulnClass::CrossSiteScripting);
+
+    // ---- Deserialization: data-only codecs are not CWE-502 ------------------
+    expect_none("go deser: json.Unmarshal of a request body is data-only", "g/d1.go",
+                handler("  body, _ := io.ReadAll(r.Body)\n"
+                        "  var payload map[string]string\n"
+                        "  json.Unmarshal(body, &payload)\n"));
+    expect_none("go deser: proto.Unmarshal is data-only", "g/d2.go",
+                handler("  body, _ := io.ReadAll(r.Body)\n"
+                        "  proto.Unmarshal(body, &message)\n"));
+
+    // ---- Code injection ------------------------------------------------------
+    expect_finding("go rce: template bound to a variable, then parsed", "g/r1.go",
+                   handler("  page := template.New(\"page\")\n"
+                           "  page.Parse(r.FormValue(\"tpl\"))\n"),
+                   VulnClass::RemoteCodeExecution, 4);
+    expect_finding("go rce: template.Must wrapping a tainted Parse", "g/r2.go",
+                   handler("  template.Must(template.New(\"page\").Parse(r.FormValue(\"tpl\")))\n"),
+                   VulnClass::RemoteCodeExecution, 3);
+    expect_finding("go rce: goja RunString", "g/r3.go",
+                   handler("  vm := goja.New()\n"
+                           "  vm.RunString(r.FormValue(\"script\"))\n"),
+                   VulnClass::RemoteCodeExecution, 4);
+    expect_finding("go rce: otto Run on a bound interpreter", "g/r4.go",
+                   handler("  vm := otto.New()\n"
+                           "  vm.Run(r.FormValue(\"script\"))\n"),
+                   VulnClass::RemoteCodeExecution, 4);
+    expect_finding("go rce: gopher-lua DoString", "g/r5.go",
+                   handler("  state := lua.NewState()\n"
+                           "  state.DoString(r.FormValue(\"script\"))\n"),
+                   VulnClass::RemoteCodeExecution, 4);
+    expect_finding("go rce: expr.Eval", "g/r6.go",
+                   handler("  expr.Eval(r.FormValue(\"rule\"), env)\n"),
+                   VulnClass::RemoteCodeExecution, 3);
+    expect_finding("go rce: plugin.Open loads attacker-chosen code", "g/r7.go",
+                   handler("  plugin.Open(r.FormValue(\"module\"))\n"),
+                   VulnClass::RemoteCodeExecution, 3);
+    expect_not_class("go rce: plugin.Open is not double-reported as path traversal", "g/r8.go",
+                     handler("  plugin.Open(r.FormValue(\"module\"))\n"),
+                     VulnClass::PathTraversal);
+
+    expect_not_class("go rce: url.Parse is not a template", "g/r9.go",
+                     handler("  url.Parse(r.FormValue(\"next\"))\n"),
+                     VulnClass::RemoteCodeExecution);
+    expect_not_class("go rce: time.Parse is not a template", "g/r10.go",
+                     handler("  time.Parse(time.RFC3339, r.FormValue(\"when\"))\n"),
+                     VulnClass::RemoteCodeExecution);
+    expect_not_class("go rce: Run on something that is not an interpreter", "g/r11.go",
+                     handler("  server.Run(r.FormValue(\"addr\"))\n"),
+                     VulnClass::RemoteCodeExecution);
+    expect_none("go rce: a constant template is not injection", "g/r12.go",
+                handler("  template.New(\"page\").Parse(\"<h1>{{.Title}}</h1>\")\n"));
+    expect_not_class("go rce: template data is not template source", "g/r13.go",
+                     handler("  page := template.Must(template.New(\"page\").Parse(\"<h1>{{.}}</h1>\"))\n"
+                             "  page.Execute(w, r.FormValue(\"title\"))\n"),
+                     VulnClass::RemoteCodeExecution);
+}
+
+// The single-hop case -- handler calls helper, helper holds the sink -- is in
+// interprocedural_suite. These are the shapes beyond it: the sink two or more
+// calls away, a source two calls away, and a sanitizer somewhere in between.
+void transitive_interprocedural_suite() {
+    harness::section("Interprocedural taint: chains of helpers");
+
+    // ---- A sink two calls away ------------------------------------------------
+    expect_finding("js chain: handler -> findUser -> run -> db.query", "t/a1.js",
+                   "const db = mysql.createConnection({});\n"
+                   "function run(sql) {\n"
+                   "  return db.query(sql);\n"
+                   "}\n"
+                   "function findUser(id) {\n"
+                   "  return run('SELECT * FROM users WHERE id = ' + id);\n"
+                   "}\n"
+                   "app.get('/u', (req, res) => {\n"
+                   "  findUser(req.query.id);\n"
+                   "});\n",
+                   VulnClass::SqlInjection, 9);
+
+    expect_finding("py chain: handler -> lookup -> run -> os.system", "t/a2.py",
+                   "import os\n"
+                   "def run(cmd):\n"
+                   "    os.system(cmd)\n"
+                   "def lookup(host):\n"
+                   "    run('nslookup ' + host)\n"
+                   "def handler():\n"
+                   "    lookup(request.args.get('host'))\n",
+                   VulnClass::CommandInjection, 7);
+
+    expect_finding("go chain: handler -> findUser -> run -> db.Query", "t/a3.go",
+                   "package main\n"
+                   "func run(q string) {\n"
+                   "  db.Query(q)\n"
+                   "}\n"
+                   "func findUser(name string) {\n"
+                   "  run(\"SELECT * FROM users WHERE name = '\" + name + \"'\")\n"
+                   "}\n"
+                   "func handler(w http.ResponseWriter, r *http.Request) {\n"
+                   "  findUser(r.FormValue(\"name\"))\n"
+                   "}\n",
+                   VulnClass::SqlInjection, 9);
+
+    // ---- Three calls away, and the callers written before their callees ---------
+    expect_finding("js chain: three helpers, defined caller-first", "t/a4.js",
+                   "const db = mysql.createConnection({});\n"
+                   "app.get('/r', (req, res) => {\n"
+                   "  report(req.query.month);\n"
+                   "});\n"
+                   "function report(month) { return build(month); }\n"
+                   "function build(month) { return fetch_rows('WHERE m = ' + month); }\n"
+                   "function fetch_rows(clause) { return db.query('SELECT * FROM r ' + clause); }\n",
+                   VulnClass::SqlInjection, 3);
+
+    // A chain longer than the fixpoint's old iteration bound, in the worst
+    // order for it: every caller appears before its callee, so an unordered
+    // pass learns one level per iteration.
+    {
+        std::string code = "const db = mysql.createConnection({});\n"
+                           "app.get('/deep', (req, res) => {\n"
+                           "  f0(req.query.v);\n"
+                           "});\n";
+        constexpr int kDepth = 14;
+        for (int i = 0; i < kDepth; ++i) {
+            code += std::format("function f{}(v) {{ return f{}(v); }}\n", i, i + 1);
+        }
+        code += std::format("function f{}(v) {{ return db.query('SELECT ' + v); }}\n", kDepth);
+        expect_finding("js chain: fourteen helpers deep, caller-first", "t/a5.js", code,
+                       VulnClass::SqlInjection, 3);
+    }
+
+    // ---- The trace names where the sink really is ------------------------------
+    expect_trace_mentions("js chain: the trace names the function holding the sink", "t/a6.js",
+                          "const db = mysql.createConnection({});\n"
+                          "function run(sql) { return db.query(sql); }\n"
+                          "function findUser(id) { return run('SELECT ' + id); }\n"
+                          "app.get('/u', (req, res) => { findUser(req.query.id); });\n",
+                          VulnClass::SqlInjection, "inside run()");
+
+    // ---- A source two calls away ----------------------------------------------
+    expect_finding("js chain: a source returned through two helpers", "t/b1.js",
+                   "const db = mysql.createConnection({});\n"
+                   "function rawId(req) { return req.query.id; }\n"
+                   "function userId(req) { return rawId(req); }\n"
+                   "app.get('/u', (req, res) => {\n"
+                   "  db.query('SELECT * FROM u WHERE id = ' + userId(req));\n"
+                   "});\n",
+                   VulnClass::SqlInjection, 5);
+
+    expect_finding("py chain: a source returned through two helpers", "t/b2.py",
+                   "import os\n"
+                   "def raw_host():\n"
+                   "    return request.args.get('host')\n"
+                   "def host():\n"
+                   "    return raw_host()\n"
+                   "def handler():\n"
+                   "    os.system('ping ' + host())\n",
+                   VulnClass::CommandInjection, 7);
+
+    // ---- Source and sink both behind helpers -----------------------------------
+    expect_class("js chain: helper source into helper sink", "t/b3.js",
+                 "const db = mysql.createConnection({});\n"
+                 "function param(req) { return req.query.q; }\n"
+                 "function search(term) { return db.query('SELECT * FROM t WHERE x = ' + term); }\n"
+                 "app.get('/s', (req, res) => { search(param(req)); });\n",
+                 VulnClass::SqlInjection);
+
+    // ---- A sanitizer in the middle of the chain --------------------------------
+    expect_none("js chain: sanitised before the helper that holds the sink", "t/c1.js",
+                "function clean(s) { return escapeHtml(s); }\n"
+                "function render(html) { document.getElementById('out').innerHTML = html; }\n"
+                "function show(text) { render(clean(text)); }\n"
+                "app.get('/p', (req, res) => { show(req.query.name); });\n");
+
+    expect_class("js chain: the same chain without the sanitizer reports", "t/c2.js",
+                 "function render(html) { document.getElementById('out').innerHTML = html; }\n"
+                 "function show(text) { render(text); }\n"
+                 "app.get('/p', (req, res) => { show(req.query.name); });\n",
+                 VulnClass::CrossSiteScripting);
+
+    expect_none("js chain: a numeric coercion two calls up clears every class", "t/c3.js",
+                "const db = mysql.createConnection({});\n"
+                "function run(sql) { return db.query(sql); }\n"
+                "function byId(id) { return run('SELECT * FROM u WHERE id = ' + parseInt(id, 10)); }\n"
+                "app.get('/u', (req, res) => { byId(req.query.id); });\n");
+
+    // ---- Recursion that reaches a sink -----------------------------------------
+    expect_class("js chain: a recursive function with a sink at its base case", "t/d1.js",
+                 "const db = mysql.createConnection({});\n"
+                 "function walk(path, depth) {\n"
+                 "  if (depth > 3) return db.query('SELECT * FROM n WHERE p = ' + path);\n"
+                 "  return walk(path, depth + 1);\n"
+                 "}\n"
+                 "app.get('/n', (req, res) => { walk(req.query.p, 0); });\n",
+                 VulnClass::SqlInjection);
+
+    expect_class("js chain: mutual recursion with a sink on one side", "t/d2.js",
+                 "const db = mysql.createConnection({});\n"
+                 "function ping(v, n) { return n > 2 ? db.query('SELECT ' + v) : pong(v, n + 1); }\n"
+                 "function pong(v, n) { return ping(v, n + 1); }\n"
+                 "app.get('/pp', (req, res) => { pong(req.query.v, 0); });\n",
+                 VulnClass::SqlInjection);
+
+    // ---- A property sink behind a helper ----------------------------------------
+    expect_finding("js chain: a helper that assigns innerHTML", "t/c4.js",
+                   "function render(html) {\n"
+                   "  document.getElementById('out').innerHTML = html;\n"
+                   "}\n"
+                   "app.get('/p', (req, res) => {\n"
+                   "  render(req.query.name);\n"
+                   "});\n",
+                   VulnClass::CrossSiteScripting, 5);
+
+    // ---- And what must stay quiet ----------------------------------------------
+    expect_none("js chain: a constant through the whole chain", "t/e1.js",
+                "const db = mysql.createConnection({});\n"
+                "function run(sql) { return db.query(sql); }\n"
+                "function findUser(id) { return run('SELECT * FROM users WHERE id = ' + id); }\n"
+                "findUser('42');\n");
+
+    expect_none("js chain: the tainted argument is not the one that reaches the sink", "t/e2.js",
+                "const db = mysql.createConnection({});\n"
+                "function run(sql, label) { return db.query(sql); }\n"
+                "function findAll(label) { return run('SELECT * FROM users', label); }\n"
+                "app.get('/u', (req, res) => { findAll(req.query.label); });\n");
+}
+
+// The summary fixpoint itself, with a stand-in for the analyzer: each function
+// "reaches a sink" if it is the leaf, or if the function it calls does.
+void summary_fixpoint_suite() {
+    harness::section("Summary fixpoint: ordering and recomputation");
+
+    const auto make = [](std::initializer_list<const char*> names) {
+        std::vector<FunctionInfo> functions;
+        for (const char* name : names) {
+            FunctionInfo info;
+            info.name = name;
+            info.parameters = {"p"};
+            functions.push_back(std::move(info));
+        }
+        return functions;
+    };
+
+    // a -> b -> c, and c holds the sink.
+    const std::map<std::string, std::string> calls = {{"a", "b"}, {"b", "c"}};
+    int computations = 0;
+    const SummaryComputer compute = [&](const FunctionInfo& function, const SummaryTable& known) {
+        ++computations;
+        FunctionSummary summary;
+        if (function.name == "c") {
+            summary.parameter_sinks.push_back({0, VulnClass::SqlInjection, 7, "db.query(p)", "c"});
+        } else if (const auto callee = calls.find(function.name); callee != calls.end()) {
+            const FunctionSummary* inner = known.find(callee->second);
+            if (inner != nullptr && inner->reaches_sink_from(0)) {
+                summary.parameter_sinks.push_back(inner->parameter_sinks.front());
+            }
+        }
+        return summary;
+    };
+
+    const auto functions = make({"a", "b", "c"});  // callers listed first
+
+    {
+        // Callees first: every function is computed exactly once.
+        SummaryPlan plan;
+        plan.order = {2, 1, 0};
+        plan.callees = {{"b"}, {"c"}, {}};
+        computations = 0;
+        const SummaryTable table = compute_summaries(functions, compute, plan);
+        const FunctionSummary* a = table.find("a");
+        harness::check(a != nullptr && a->reaches_sink_from(0),
+                       "fixpoint: the sink at the end of the chain reaches its first caller");
+        harness::check(a != nullptr && !a->parameter_sinks.empty() &&
+                           a->parameter_sinks.front().sink_function == "c" &&
+                           a->parameter_sinks.front().line == 7,
+                       "fixpoint: and still names the function and line that hold it");
+        harness::check(computations == 3,
+                       "fixpoint: callee-first order settles an acyclic chain in one pass",
+                       std::format("{} computations for 3 functions", computations));
+    }
+
+    {
+        // No plan: source order, everything recomputed each pass. Slower, same answer.
+        computations = 0;
+        const SummaryTable table = compute_summaries(functions, compute);
+        const FunctionSummary* a = table.find("a");
+        harness::check(a != nullptr && a->reaches_sink_from(0) && computations > 3,
+                       "fixpoint: without a plan it still converges, by iterating",
+                       std::format("{} computations", computations));
+    }
+
+    {
+        // Dependencies known but the order adverse: only stale functions are redone.
+        SummaryPlan plan;
+        plan.order = {0, 1, 2};
+        plan.callees = {{"b"}, {"c"}, {}};
+        computations = 0;
+        const SummaryTable table = compute_summaries(functions, compute, plan);
+        const FunctionSummary* a = table.find("a");
+        // Pass 1 computes a, b, c (b sees c's seed, not its result). Pass 2 redoes
+        // b only; pass 3 redoes a only. Five in all, where recomputing everything
+        // on every pass until nothing moves would take twelve.
+        harness::check(a != nullptr && a->reaches_sink_from(0) && computations == 5,
+                       "fixpoint: in a bad order, only functions whose callees changed are redone",
+                       std::format("{} computations", computations));
+    }
+
+    {
+        // A function that calls itself is revisited until it stops changing.
+        const auto recursive = make({"walk"});
+        int depth_learned = 0;
+        int visits = 0;
+        const SummaryComputer grow = [&](const FunctionInfo&, const SummaryTable& known) {
+            ++visits;
+            FunctionSummary summary;
+            const FunctionSummary* self = known.find("walk");
+            // Learns one more fact per visit, up to three, as a recursive
+            // summary that depends on its own previous value would.
+            depth_learned = std::min<int>(3, static_cast<int>(self->parameter_sinks.size()) + 1);
+            for (int i = 0; i < depth_learned; ++i) {
+                summary.parameter_sinks.push_back(
+                    {static_cast<std::size_t>(i), VulnClass::SqlInjection, 1, "", "walk"});
+            }
+            return summary;
+        };
+        SummaryPlan plan;
+        plan.order = {0};
+        plan.callees = {{"walk"}};
+        const SummaryTable table = compute_summaries(recursive, grow, plan);
+        harness::check(table.find("walk")->parameter_sinks.size() == 3 && visits == 4,
+                       "fixpoint: recursion iterates to its fixpoint and then stops",
+                       std::format("{} facts after {} visits", table.find("walk")->parameter_sinks.size(),
+                                   visits));
+    }
+
+    {
+        // Two definitions with one name: the table holds what either does.
+        const auto twins = make({"save", "save"});
+        const SummaryComputer one_each = [&](const FunctionInfo& function, const SummaryTable&) {
+            FunctionSummary summary;
+            const bool first = &function == &twins[0];
+            summary.parameter_sinks.push_back(
+                {0, first ? VulnClass::SqlInjection : VulnClass::PathTraversal, 1, "", "save"});
+            return summary;
+        };
+        const SummaryTable table = compute_summaries(twins, one_each);
+        const FunctionSummary* save = table.find("save");
+        harness::check(save != nullptr && save->parameter_sinks.size() == 2,
+                       "fixpoint: same-named definitions are combined, neither hides the other");
+    }
+}
+
+// These assert what the engine does NOT do. Each is a real limit, written down
+// as a test so that it is a known quantity rather than a surprise, and so that
+// whoever lifts one finds the test that has to change.
+void known_limit_suite() {
+    harness::section("Known limits (asserted so they stay visible)");
+
+    // A function passed as a value is summarised, but nothing connects the
+    // values it is eventually called with to its parameter.
+    expect_none("limit: a callback's parameter is not connected to its caller's data",
+                "limits/callback.js",
+                "const db = mysql.createConnection({});\n"
+                "function each(items, fn) { items.forEach(fn); }\n"
+                "app.get('/x', (req, res) => {\n"
+                "  each([req.query.a], (v) => db.query('SELECT ' + v));\n"
+                "});\n");
+
+    // Calls are matched to functions by name, not by receiver, so two methods
+    // called `save` are one function. This over-reports.
+    expect_class("limit: methods are matched by name, so cache.save is read as audit.save",
+                 "limits/methods.js",
+                 "const db = mysql.createConnection({});\n"
+                 "const audit = { save(entry) { db.query('INSERT INTO log VALUES (' + entry + ')'); } };\n"
+                 "const cache = { save(entry) { memory.push(entry); } };\n"
+                 "app.post('/c', (req, res) => { cache.save(req.body.item); });\n",
+                 VulnClass::SqlInjection);
+
+    // Taint is per variable, not per field: assigning one field taints the
+    // whole object, and so every other field read from it.
+    expect_class("limit: no field sensitivity, tainting user.name taints user.id",
+                 "limits/fields.js",
+                 "app.post('/u', (req, res) => {\n"
+                 "  const user = {};\n"
+                 "  user.name = req.body.name;\n"
+                 "  user.id = 7;\n"
+                 "  res.redirect('/users/' + user.id);\n"
+                 "});\n",
+                 VulnClass::OpenRedirect);
+
+    // A helper defined in another file has no summary here. The call is
+    // treated as an unknown function: its result carries its arguments' taint,
+    // but a sink inside it is invisible.
+    expect_none("limit: a sink inside an imported helper is not seen",
+                "limits/crossfile.js",
+                "const { runQuery } = require('./db');\n"
+                "app.get('/u', (req, res) => {\n"
+                "  runQuery('SELECT * FROM u WHERE id = ' + req.query.id);\n"
+                "});\n");
+}
+
+std::size_t count_class(const std::vector<Finding>& findings, VulnClass id) {
+    return static_cast<std::size_t>(std::ranges::count(findings, id, &Finding::vulnerability));
+}
+
+// Each case here is a false positive (or a double count) that the benchmark
+// over real repositories turned up, reduced to the smallest code that shows it,
+// next to the true positive it must not be confused with.
+void benchmark_regression_suite() {
+    harness::section("Regressions found by the benchmark corpus");
+
+    const auto go_handler = [](const std::string& body) {
+        return "package main\nfunc h(w http.ResponseWriter, r *http.Request) {\n" + body + "}\n";
+    };
+
+    // ---- One construct, one finding -----------------------------------------
+    {
+        const auto findings = analyze("net/client.go",
+                                      "package main\n"
+                                      "func client() *http.Client {\n"
+                                      "  tr := &http.Transport{\n"
+                                      "    TLSClientConfig: &tls.Config{\n"
+                                      "      InsecureSkipVerify: true,\n"
+                                      "    },\n"
+                                      "  }\n"
+                                      "  return &http.Client{Transport: tr}\n"
+                                      "}\n");
+        harness::check(count_class(findings, VulnClass::WeakCryptography) == 1,
+                       "config: a nested literal is reported once, not once per enclosing entry",
+                       describe(findings));
+        harness::check(!findings.empty() && findings.front().line == 5,
+                       "config: and on the line the setting is written",
+                       describe(findings));
+    }
+
+    // ---- Sources match whole name segments -----------------------------------
+    harness::check(source_pattern_matches("r.Form", "r.Form") &&
+                       source_pattern_matches("r.Form.Get", "r.Form") &&
+                       source_pattern_matches("r.Form[\"q\"]", "r.Form") &&
+                       source_pattern_matches("ctx.req.query.id", "req.query"),
+                   "source match: a pattern matches at segment boundaries");
+    harness::check(!source_pattern_matches("r.Format", "r.Form") &&
+                       !source_pattern_matches("r.Formatter.Run", "r.Form") &&
+                       !source_pattern_matches("prereq.query", "req.query") &&
+                       !source_pattern_matches("req.filename", "req.file"),
+                   "source match: but not inside a longer identifier");
+    harness::check(source_pattern_matches("input(", "input(") &&
+                       source_pattern_matches("x = input(", "input(") &&
+                       !source_pattern_matches("raw_input(", "input("),
+                   "source match: a pattern ending in punctuation needs no right boundary");
+
+    expect_none("go source: r.Format is a field, not the parsed form", "render/text.go",
+                "package render\n"
+                "func (r String) Render(w http.ResponseWriter) error {\n"
+                "  fmt.Fprintf(w, r.Format, r.Data...)\n"
+                "  return nil\n"
+                "}\n");
+    expect_class("go source: r.Form.Get still is", "h/form.go",
+                 go_handler("  db.Query(\"SELECT * FROM u WHERE n = '\" + r.Form.Get(\"n\") + \"'\")\n"),
+                 VulnClass::SqlInjection);
+    expect_class("go source: gin c.Params", "h/params.go",
+                 "package main\n"
+                 "func h(c *gin.Context) {\n"
+                 "  db.Query(\"SELECT * FROM u WHERE id = \" + c.Params.ByName(\"id\"))\n"
+                 "}\n",
+                 VulnClass::SqlInjection);
+    expect_none("js source: req.queryCache is not req.query", "src/cache.js",
+                "const db = mysql.createConnection({});\n"
+                "db.query('SELECT * FROM t WHERE k = ' + req.queryCache.key);\n");
+
+    // ---- A prepared statement's arguments are bound values --------------------
+    expect_none("go sql: arguments to a prepared statement are parameters", "db/stmt.go",
+                go_handler("  stmt, _ := db.Prepare(\"SELECT * FROM u WHERE name = ?\")\n"
+                           "  stmt.QueryRow(r.FormValue(\"name\"))\n"));
+    expect_none("go sql: a *sql.Stmt parameter is recognised by its type", "db/stmt2.go",
+                "package main\n"
+                "func find(stmt *sql.Stmt, r *http.Request) {\n"
+                "  stmt.Query(r.FormValue(\"name\"))\n"
+                "}\n");
+    expect_none("go sql: a helper that binds its parameter is not a sink", "db/stmt3.go",
+                "package main\n"
+                "func lookup(name string) {\n"
+                "  stmt, _ := db.Prepare(\"SELECT * FROM u WHERE name = ?\")\n"
+                "  stmt.QueryRow(name)\n"
+                "}\n"
+                "func h(w http.ResponseWriter, r *http.Request) {\n"
+                "  lookup(r.FormValue(\"name\"))\n"
+                "}\n");
+    expect_finding("go sql: tainted text given to Prepare is still injection", "db/stmt4.go",
+                   go_handler("  db.Prepare(\"SELECT * FROM u WHERE name = '\" + r.FormValue(\"name\") + \"'\")\n"),
+                   VulnClass::SqlInjection, 3);
+    expect_finding("go sql: QueryRow on the database itself is still injection", "db/stmt5.go",
+                   go_handler("  db.QueryRow(\"SELECT * FROM u WHERE name = '\" + r.FormValue(\"name\") + \"'\")\n"),
+                   VulnClass::SqlInjection, 3);
+
+    // ---- An ORM where-clause is not a document-database filter ---------------
+    expect_none("js nosql: Sequelize find({ where }) is an ORM query", "src/orm.js",
+                "app.get('/u', (req, res) => {\n"
+                "  db.User.find({ where: { id: req.query.id } });\n"
+                "});\n");
+    expect_class("js nosql: a tainted filter on a Mongo collection still reports", "src/mongo.js",
+                 "const users = db.collection('users');\n"
+                 "app.post('/login', (req, res) => {\n"
+                 "  users.findOne({ name: req.body.name, password: req.body.password });\n"
+                 "});\n",
+                 VulnClass::NoSqlInjection);
+    expect_class("js nosql: so does $where, which is not the ORM key", "src/mongo2.js",
+                 "const users = db.collection('users');\n"
+                 "users.find({ $where: req.body.predicate });\n",
+                 VulnClass::NoSqlInjection);
+
+    // ---- A non-cryptographic RNG matters only where it must be unpredictable --
+    expect_none("js rng: Math.random for jitter is not a weakness", "src/retry.js",
+                "const delay = 100 + Math.random() * 50;\n");
+    expect_none("js rng: nor for a DOM element id", "src/tooltip.js",
+                "Tooltip.prototype.getUID = function (prefix) {\n"
+                "  do prefix += ~~(Math.random() * 1000000)\n"
+                "  while (document.getElementById(prefix))\n"
+                "  return prefix\n"
+                "}\n");
+    expect_class("js rng: Math.random for a session id is", "src/session.js",
+                 "const sessionId = Math.random().toString(36).slice(2);\n",
+                 VulnClass::WeakCryptography);
+    expect_class("js rng: the enclosing function's name counts as context", "src/reset.js",
+                 "function generateResetCode() {\n"
+                 "  return Math.floor(Math.random() * 1000000);\n"
+                 "}\n",
+                 VulnClass::WeakCryptography);
+    expect_none("py rng: random.random for a backoff is not a weakness", "src/retry.py",
+                "import random\n"
+                "delay = 1.0 + random.random()\n");
+    expect_class("py rng: random.random for a one-time code is", "src/otp.py",
+                 "import random\n"
+                 "otp = int(random.random() * 1000000)\n",
+                 VulnClass::WeakCryptography);
+
+    // ---- `loads` is only dangerous on a serializer that builds objects ---------
+    expect_none("py deser: a signed-cookie serializer's loads is not pickle", "src/sess.py",
+                "s = URLSafeTimedSerializer(secret)\n"
+                "data = s.loads(request.cookies.get('session'))\n");
+    expect_class("py deser: pickle imported under an alias still reports", "src/alias.py",
+                 "import pickle as pk\n"
+                 "pk.loads(request.data)\n",
+                 VulnClass::InsecureDeserialization);
+    expect_class("py deser: so does a bare loads imported from pickle", "src/bare.py",
+                 "from pickle import loads\n"
+                 "loads(request.data)\n",
+                 VulnClass::InsecureDeserialization);
+    expect_none("py deser: a bare loads imported from json does not", "src/barejson.py",
+                "from json import loads\n"
+                "loads(request.data)\n");
+
+    // ---- One flaw, one finding: a flow and a pattern on the same call ---------
+    {
+        const auto findings = analyze("src/dig.py",
+                                      "import subprocess\n"
+                                      "command = 'dig ' + request.POST['domain']\n"
+                                      "process = subprocess.Popen(\n"
+                                      "    command,\n"
+                                      "    shell=True,\n"
+                                      "    stdout=subprocess.PIPE)\n");
+        harness::check(count_class(findings, VulnClass::CommandInjection) == 1,
+                       "config: shell=True inside an already-reported call is not a second finding",
+                       describe(findings));
+    }
+    expect_class("config: shell=True with no tainted flow is still reported by itself", "src/sh.py",
+                 "import subprocess\n"
+                 "subprocess.Popen(build_command(), shell=True)\n",
+                 VulnClass::CommandInjection);
+
+    // ---- Operator-controlled input is still reported, at low confidence ------
+    expect_confidence("local source: argv reaching a shell is low confidence", "tools/run.js",
+                      "const cp = require('child_process');\n"
+                      "cp.exec('ls ' + process.argv[2]);\n",
+                      VulnClass::CommandInjection, Confidence::Low);
+    expect_confidence("local source: the same flow from a request is not", "src/run.js",
+                      "const cp = require('child_process');\n"
+                      "cp.exec('ls ' + req.query.dir);\n",
+                      VulnClass::CommandInjection, Confidence::High);
+    expect_confidence("local source: sys.argv through a variable stays low", "tools/brute.py",
+                      "import subprocess, sys\n"
+                      "program = sys.argv[1]\n"
+                      "subprocess.run(program)\n",
+                      VulnClass::CommandInjection, Confidence::Low);
+    expect_confidence("local source: an environment variable naming a file", "tools/conf.py",
+                      "import os\n"
+                      "open(os.environ['APP_CONFIG'])\n",
+                      VulnClass::PathTraversal, Confidence::Low);
+    {
+        const TaintFact remote = fact_from_source("req.query.x", {1, "x", "entered"});
+        TaintFact local = fact_from_source("sys.argv", {2, "y", "entered"});
+        local.local = true;
+        harness::check(!merge(remote, local).local && !merge(local, remote).local &&
+                           merge(local, local).local,
+                       "local source: a value also reachable from a request is not local");
+    }
+}
+
+// A sanitizer is rarely called directly at the sink. Real code wraps it --
+// `clean()`, `safe()`, a one-line arrow function -- and the engine has to see
+// through the wrapper in both directions: the wrapped value is clean for what
+// the sanitizer covers, and still dirty for everything else.
+void sanitizer_wrapper_suite() {
+    harness::section("Sanitizers behind user-defined wrappers");
+
+    // ---- JavaScript ----------------------------------------------------------
+    expect_none("js wrapper: escapeHtml wrapper clears XSS", "w/a1.js",
+                "function clean(s) {\n"
+                "  return escapeHtml(s);\n"
+                "}\n"
+                "const el = document.getElementById('out');\n"
+                "el.innerHTML = clean(req.query.name);\n");
+
+    expect_finding("js wrapper: the same wrapper does not clear SQL injection", "w/a2.js",
+                   "const db = mysql.createConnection({});\n"
+                   "function clean(s) {\n"
+                   "  return escapeHtml(s);\n"
+                   "}\n"
+                   "db.query('SELECT * FROM u WHERE n = ' + clean(req.query.name));\n",
+                   VulnClass::SqlInjection, 5);
+
+    expect_none("js wrapper: parseInt wrapper clears every class", "w/a3.js",
+                "const db = mysql.createConnection({});\n"
+                "function toId(value) {\n"
+                "  return parseInt(value, 10);\n"
+                "}\n"
+                "db.query('SELECT * FROM u WHERE id = ' + toId(req.query.id));\n");
+
+    expect_none("js wrapper: sanitizer result held in a local first", "w/a4.js",
+                "function clean(s) {\n"
+                "  const out = escapeHtml(s);\n"
+                "  return out;\n"
+                "}\n"
+                "document.getElementById('out').innerHTML = clean(req.query.name);\n");
+
+    expect_none("js wrapper: expression-bodied arrow sanitizer", "w/a5.js",
+                "const clean = (s) => escapeHtml(s);\n"
+                "document.getElementById('out').innerHTML = clean(req.query.name);\n");
+
+    // The mirror image: an expression-bodied arrow that is a plain conduit must
+    // keep the taint. It has no `return` statement to find.
+    expect_finding("js wrapper: expression-bodied arrow conduit keeps taint", "w/a6.js",
+                   "const db = mysql.createConnection({});\n"
+                   "const where = (v) => 'SELECT * FROM u WHERE id = ' + v;\n"
+                   "db.query(where(req.query.id));\n",
+                   VulnClass::SqlInjection, 3);
+
+    // One unsanitised path out is enough to stay dirty.
+    expect_finding("js wrapper: a branch that skips the sanitizer still reports", "w/a7.js",
+                   "function maybeClean(s, raw) {\n"
+                   "  if (raw) return s;\n"
+                   "  return escapeHtml(s);\n"
+                   "}\n"
+                   "document.getElementById('out').innerHTML = maybeClean(req.query.name, true);\n",
+                   VulnClass::CrossSiteScripting, 5);
+
+    // A helper that reads the source itself and sanitises it.
+    expect_none("js wrapper: source-returning helper sanitised for XSS", "w/a8.js",
+                "function displayName(req) {\n"
+                "  return escapeHtml(req.query.name);\n"
+                "}\n"
+                "app.get('/', (req, res) => {\n"
+                "  document.getElementById('out').innerHTML = displayName(req);\n"
+                "});\n");
+
+    expect_class("js wrapper: that helper's value is still SQL-dangerous", "w/a9.js",
+                 "const db = mysql.createConnection({});\n"
+                 "function displayName(req) {\n"
+                 "  return escapeHtml(req.query.name);\n"
+                 "}\n"
+                 "app.get('/', (req, res) => {\n"
+                 "  db.query('SELECT * FROM u WHERE n = ' + displayName(req));\n"
+                 "});\n",
+                 VulnClass::SqlInjection);
+
+    // Wrappers compose.
+    expect_none("js wrapper: a wrapper around a wrapper", "w/a10.js",
+                "function inner(s) { return escapeHtml(s); }\n"
+                "function outer(s) { return inner(s); }\n"
+                "document.getElementById('out').innerHTML = outer(req.query.name);\n");
+
+    // Library escapes addressed by their dotted names.
+    expect_none("js sanitizer: lodash _.escape clears XSS", "w/a11.js",
+                "document.getElementById('out').innerHTML = _.escape(req.query.name);\n");
+    expect_none("js sanitizer: validator.escape clears XSS", "w/a12.js",
+                "document.getElementById('out').innerHTML = validator.escape(req.query.name);\n");
+    expect_none("js sanitizer: connection.escape clears SQL injection", "w/a13.js",
+                "const connection = mysql.createConnection({});\n"
+                "connection.query('SELECT * FROM u WHERE n = ' + connection.escape(req.query.n));\n");
+    expect_class("js sanitizer: connection.escape does not clear XSS", "w/a14.js",
+                 "const connection = mysql.createConnection({});\n"
+                 "document.getElementById('out').innerHTML = connection.escape(req.query.n);\n",
+                 VulnClass::CrossSiteScripting);
+
+    // ---- Python --------------------------------------------------------------
+    expect_none("py wrapper: html.escape wrapper clears XSS", "w/b1.py",
+                "import html\n"
+                "from markupsafe import Markup\n"
+                "def clean(s):\n"
+                "    return html.escape(s)\n"
+                "Markup(clean(request.args['name']))\n");
+
+    expect_finding("py wrapper: the same wrapper does not clear command injection", "w/b2.py",
+                   "import html, os\n"
+                   "def clean(s):\n"
+                   "    return html.escape(s)\n"
+                   "os.system('ping ' + clean(request.args['host']))\n",
+                   VulnClass::CommandInjection, 4);
+
+    expect_none("py wrapper: shlex.quote wrapper clears command injection", "w/b3.py",
+                "import os, shlex\n"
+                "def arg(s):\n"
+                "    return shlex.quote(s)\n"
+                "os.system('ping ' + arg(request.args['host']))\n");
+
+    expect_none("py wrapper: lambda sanitizer", "w/b4.py",
+                "import html\n"
+                "from markupsafe import Markup\n"
+                "clean = lambda s: html.escape(s)\n"
+                "Markup(clean(request.args['name']))\n");
+
+    expect_finding("py wrapper: lambda conduit keeps taint", "w/b5.py",
+                   "cursor = conn.cursor()\n"
+                   "where = lambda v: 'SELECT * FROM u WHERE id = ' + v\n"
+                   "cursor.execute(where(request.args['id']))\n",
+                   VulnClass::SqlInjection, 3);
+
+    expect_none("py wrapper: int() wrapper clears every class", "w/b6.py",
+                "cursor = conn.cursor()\n"
+                "def to_id(value):\n"
+                "    return int(value)\n"
+                "cursor.execute('SELECT * FROM u WHERE id = ' + str(to_id(request.args['id'])))\n");
+
+    // ---- Go ------------------------------------------------------------------
+    expect_none("go wrapper: html.EscapeString wrapper clears XSS", "w/c1.go",
+                "package main\n"
+                "func clean(s string) string {\n"
+                "  return html.EscapeString(s)\n"
+                "}\n"
+                "func h(w http.ResponseWriter, r *http.Request) {\n"
+                "  fmt.Fprintf(w, \"<p>%s</p>\", clean(r.FormValue(\"q\")))\n"
+                "}\n");
+
+    expect_finding("go wrapper: the same wrapper does not clear SQL injection", "w/c2.go",
+                   "package main\n"
+                   "func clean(s string) string {\n"
+                   "  return html.EscapeString(s)\n"
+                   "}\n"
+                   "func h(w http.ResponseWriter, r *http.Request) {\n"
+                   "  db.Query(\"SELECT * FROM u WHERE n = '\" + clean(r.FormValue(\"n\")) + \"'\")\n"
+                   "}\n",
+                   VulnClass::SqlInjection, 6);
+
+    expect_none("go wrapper: filepath.Base wrapper clears path traversal", "w/c3.go",
+                "package main\n"
+                "func leaf(p string) string {\n"
+                "  return filepath.Base(p)\n"
+                "}\n"
+                "func h(w http.ResponseWriter, r *http.Request) {\n"
+                "  os.Open(\"/srv/data/\" + leaf(r.FormValue(\"f\")))\n"
+                "}\n");
+
+    expect_none("go wrapper: strconv.Atoi wrapper clears every class", "w/c4.go",
+                "package main\n"
+                "func toID(s string) int {\n"
+                "  id, _ := strconv.Atoi(s)\n"
+                "  return id\n"
+                "}\n"
+                "func h(w http.ResponseWriter, r *http.Request) {\n"
+                "  db.Query(fmt.Sprintf(\"SELECT * FROM u WHERE id = %d\", toID(r.FormValue(\"id\"))))\n"
+                "}\n");
+}
+
+// The mask is a compile-time value type, so its algebra is checked by the
+// compiler: if one of these stops holding, the test binary does not build.
+constexpr SanitizerMask mask_of_classes(std::initializer_list<VulnClass> classes) {
+    SanitizerMask mask;
+    for (const VulnClass id : classes) mask.add(id);
+    return mask;
+}
+static_assert(SanitizerMask{}.empty());
+static_assert(mask_of_classes({VulnClass::CrossSiteScripting}).covers(VulnClass::CrossSiteScripting));
+static_assert(!mask_of_classes({VulnClass::CrossSiteScripting}).covers(VulnClass::SqlInjection));
+static_assert(mask_of_classes({VulnClass::CrossSiteScripting})
+                  .merged_with(mask_of_classes({VulnClass::SqlInjection}))
+                  .empty(),
+              "joining two flows keeps only what both were cleaned for");
+static_assert(mask_of_classes({VulnClass::SqlInjection}).raw() ==
+              std::uint32_t{1} << std::to_underlying(VulnClass::SqlInjection));
+
+// Queue messages are untrusted input. parse_job is the boundary where a
+// malformed one becomes an error value instead of an exception thrown from
+// somewhere inside the scan loop.
+void job_suite() {
+    harness::section("Scan job parsing (std::expected)");
+
+    {
+        const auto job = parse_job(
+            R"({"job_id":"abc123","repository":"acme/web","commit":"deadbeef",)"
+            R"("files":[{"path":"src/a.js","content":"eval(req.query.x);\n"},)"
+            R"({"path":"src/b.py","content":"x = 1\n"}]})");
+        harness::check(job.has_value(), "job: a well-formed job parses",
+                       job ? "" : job.error());
+        if (job) {
+            harness::check(job->job_id == "abc123" && job->repository == "acme/web" &&
+                               job->commit == "deadbeef",
+                           "job: carries id, repository and commit");
+            harness::check(job->files.size() == 2 && job->files[0].path == "src/a.js" &&
+                               job->files[1].content == "x = 1\n",
+                           "job: carries every file in order");
+
+            // The parsed job feeds the engine unchanged.
+            const auto report = scan_detailed(job->repository, job->files[0]);
+            harness::check(report.findings.size() == 1 &&
+                               report.findings[0].vulnerability == VulnClass::RemoteCodeExecution,
+                           "job: a parsed file analyses like any other",
+                           describe(report.findings));
+        }
+    }
+
+    {
+        const auto job = parse_job(R"({"files":[]})");
+        harness::check(job.has_value() && job->files.empty() && job->job_id == "-" &&
+                           job->repository == "unknown/repo",
+                       "job: missing fields take defaults and an empty job is valid");
+    }
+
+    {
+        const auto job = parse_job(R"({"job_id":"x"})");
+        harness::check(job.has_value() && job->files.empty(),
+                       "job: an absent files array is an empty job");
+    }
+
+    const auto expect_error = [](std::string_view label, std::string_view body,
+                                 std::string_view needle) {
+        const auto job = parse_job(body);
+        const bool ok = !job.has_value() && job.error().contains(needle);
+        harness::check(ok, label,
+                       ok ? ""
+                          : std::format("expected an error mentioning '{}', got: {}", needle,
+                                        job ? "a parsed job" : job.error()));
+    };
+
+    expect_error("job: truncated JSON is an error, not an exception",
+                 R"({"job_id": "x", "files": [)", "not valid JSON");
+    expect_error("job: an empty body is an error", "", "not valid JSON");
+    expect_error("job: a top-level array is rejected", R"([{"path":"a.js"}])",
+                 "must be a JSON object");
+    expect_error("job: files as a string is rejected", R"({"files":"src/a.js"})",
+                 "'files' must be an array");
+    expect_error("job: a non-object file entry names its index",
+                 R"({"files":[{"path":"a.js","content":""},"b.js"]})", "files[1]");
+    expect_error("job: non-string content names the field",
+                 R"({"files":[{"path":"a.js","content":42}]})", "'content' must be a string");
+    expect_error("job: a numeric job_id is rejected", R"({"job_id":7,"files":[]})",
+                 "'job_id' must be a string");
+}
+
+// The result document is a contract with the gateway, which stores it, and
+// with the benchmark, which counts from it. These pin the parts both rely on.
+void scan_result_suite() {
+    harness::section("Scan result serialisation");
+
+    ScanResult result;
+    result.job_id = "job-42";
+    result.repository = "acme/web";
+    result.commit = "deadbeef";
+
+    const auto report = scan_detailed(
+        "acme/web", {"src/app.js", "const db = mysql.createConnection({});\n"
+                                   "const id = req.query.id;\n"
+                                   "db.query('SELECT * FROM u WHERE id = ' + id);\n"
+                                   "eval(req.body.code);\n"
+                                   "fetch(req.query.url);\n"});
+    result.absorb(report);
+    result.absorb(scan_detailed("acme/web", {"docs/notes.md", "not source"}));
+    harness::check(report.findings.size() == 3, "result: fixture yields three findings",
+                   describe(report.findings));
+    if (report.findings.size() != 3) return;
+
+    result.findings.push_back({report.findings[0], Verdict::Escalated, 0.31, "nothing similar"});
+    result.findings.push_back({report.findings[1], Verdict::Suppressed, 0.93, "seen before"});
+    result.findings.push_back({report.findings[2], Verdict::Untriaged, 0.0, "triage disabled"});
+
+    harness::check(result.count(Verdict::Escalated) == 1 && result.count(Verdict::Suppressed) == 1 &&
+                       result.count(Verdict::Untriaged) == 1,
+                   "result: counts findings by verdict");
+
+    const std::string compact = to_json(result);
+    harness::check(!compact.contains('\n'), "result: the queue form is a single line");
+
+    // Round-trip through the job parser's sibling: the text must be JSON the
+    // other side can read, with the fields it reads.
+    const auto has = [&](std::string_view needle) { return compact.contains(needle); };
+    harness::check(has(R"("job_id":"job-42")") && has(R"("repository":"acme/web")") &&
+                       has(R"("commit":"deadbeef")"),
+                   "result: identifies the job it belongs to");
+    harness::check(has(R"("status":"COMPLETED")"), "result: a normal scan is COMPLETED");
+    harness::check(has(std::format(R"("worker_version":"{}")", kVersion)),
+                   "result: carries the worker version");
+    harness::check(has(R"("files_scanned":1)") && has(R"("findings":3)") &&
+                       has(R"("escalated":1)") && has(R"("suppressed":1)") &&
+                       has(R"("untriaged":1)"),
+                   "result: summary totals match the findings");
+    harness::check(has(R"("verdict":"ESCALATED")") && has(R"("verdict":"SUPPRESSED")") &&
+                       has(R"("verdict":"UNTRIAGED")"),
+                   "result: every finding carries its verdict");
+    harness::check(has(R"("triage_reason":"seen before")") && has(R"("triage_confidence":0.93)"),
+                   "result: carries the triage explanation and similarity");
+    harness::check(has(R"("class":"sql-injection")") && has(R"("cwe":"CWE-89")") &&
+                       has(R"("file":"src/app.js")"),
+                   "result: findings carry class, CWE and location");
+    harness::check(has(R"("trace":[{)") && has("flows into 'id'"),
+                   "result: the taint trace is included");
+    harness::check(result.files.size() == 1 && has(R"("path":"src/app.js")") &&
+                       has(R"("language":"javascript")") && has(R"("had_parse_errors":false)"),
+                   "result: lists each supported file with its language and parse state");
+    harness::check(has(R"("files_skipped":1)") && !has("docs/notes.md"),
+                   "result: an unsupported file is counted as skipped, not listed");
+
+    {
+        ScanResult failed;
+        failed.job_id = "job-43";
+        failed.failed = true;
+        failed.error = "boom";
+        const std::string text = to_json(failed);
+        harness::check(text.contains(R"("status":"FAILED")") && text.contains(R"("error":"boom")") &&
+                           text.contains(R"("findings":[])"),
+                       "result: a failed job reports FAILED with its error and no findings");
+    }
+
+    {
+        // A snippet that is not valid UTF-8 must not lose the whole result.
+        ScanResult binary = result;
+        binary.findings[0].finding.snippet = std::string("caf\xe9 \xff\xfe");
+        std::string text;
+        bool threw = false;
+        try {
+            text = to_json(binary);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        harness::check(!threw && text.contains(R"("job_id":"job-42")"),
+                       "result: invalid UTF-8 in a snippet does not abort serialisation");
+    }
+
+    harness::check(to_json(result, 2).contains("\n  \"job_id\""),
+                   "result: an indented form is available for reports");
+}
+
 }  // namespace
 
 int main() {
@@ -1919,6 +3087,15 @@ int main() {
     sarif_suite();
     unit_suite();
     scan_summary_suite();
+    job_suite();
+    class_matrix_suite();
+    go_receiver_precision_suite();
+    sanitizer_wrapper_suite();
+    benchmark_regression_suite();
+    transitive_interprocedural_suite();
+    summary_fixpoint_suite();
+    known_limit_suite();
+    scan_result_suite();
 
     // Rule-table coverage matrices.
     js_source_coverage_suite();

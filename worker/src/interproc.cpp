@@ -1,7 +1,10 @@
 #include "interproc.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
+#include <numeric>
+#include <ranges>
 #include <utility>
 
 #include "ast.hpp"
@@ -62,10 +65,7 @@ std::string anonymous_name(int line) {
 // ---- FunctionSummary ------------------------------------------------------
 
 bool FunctionSummary::reaches_sink_from(std::size_t parameter_index) const {
-    return std::any_of(parameter_sinks.begin(), parameter_sinks.end(),
-                       [parameter_index](const ParamSink& sink) {
-                           return sink.parameter_index == parameter_index;
-                       });
+    return std::ranges::contains(parameter_sinks, parameter_index, &ParamSink::parameter_index);
 }
 
 std::vector<ParamSink> FunctionSummary::sinks_for(std::size_t parameter_index) const {
@@ -79,20 +79,39 @@ std::vector<ParamSink> FunctionSummary::sinks_for(std::size_t parameter_index) c
 bool FunctionSummary::equivalent_to(const FunctionSummary& other) const {
     if (returns_taint != other.returns_taint) return false;
     if (parameters_returned != other.parameters_returned) return false;
-    if (sanitizes.raw() != other.sanitizes.raw()) return false;
     if (parameter_sinks.size() != other.parameter_sinks.size()) return false;
 
     // Sink order depends on AST traversal order, which is stable within a run,
     // so a positional comparison is sufficient and avoids a sort on every
     // fixpoint iteration.
-    for (std::size_t i = 0; i < parameter_sinks.size(); ++i) {
-        const ParamSink& a = parameter_sinks[i];
-        const ParamSink& b = other.parameter_sinks[i];
+    for (const auto& [a, b] : std::views::zip(parameter_sinks, other.parameter_sinks)) {
         if (a.parameter_index != b.parameter_index) return false;
         if (a.vulnerability != b.vulnerability) return false;
         if (a.line != b.line) return false;
     }
     return true;
+}
+
+void FunctionSummary::absorb(const FunctionSummary& other) {
+    parameter_count = std::max(parameter_count, other.parameter_count);
+
+    for (const auto& sink : other.parameter_sinks) {
+        const bool known = std::ranges::any_of(parameter_sinks, [&](const ParamSink& mine) {
+            return mine.parameter_index == sink.parameter_index &&
+                   mine.vulnerability == sink.vulnerability;
+        });
+        if (!known) parameter_sinks.push_back(sink);
+    }
+
+    for (const auto& [index, classes] : other.parameters_returned) {
+        ClassSet& mine = parameters_returned[index];
+        for (const auto& meta : all_vulnerability_classes()) {
+            if (classes.covers(meta.id)) mine.add(meta.id);
+        }
+    }
+    for (const auto& meta : all_vulnerability_classes()) {
+        if (other.returns_taint.covers(meta.id)) returns_taint.add(meta.id);
+    }
 }
 
 // ---- SummaryTable ---------------------------------------------------------
@@ -127,7 +146,8 @@ const FunctionSummary* SummaryTable::resolve(std::string_view dotted_callee) con
 // ---- Fixpoint driver ------------------------------------------------------
 
 SummaryTable compute_summaries(const std::vector<FunctionInfo>& functions,
-                               const SummaryComputer& compute, int max_iterations) {
+                               const SummaryComputer& compute, const SummaryPlan& plan,
+                               int max_iterations) {
     SummaryTable table;
     if (functions.empty()) return table;
 
@@ -141,23 +161,62 @@ SummaryTable compute_summaries(const std::vector<FunctionInfo>& functions,
         table.set(function.name, std::move(seed));
     }
 
-    // Iterate until no summary changes. In practice this settles in two or
-    // three passes: one to learn the leaves, one to propagate into their
-    // callers, and one to confirm nothing moved.
+    std::vector<std::size_t> order = plan.order;
+    if (order.size() != functions.size()) {
+        order.resize(functions.size());
+        std::ranges::iota(order, std::size_t{0});
+    }
+    const bool have_dependencies = plan.callees.size() == functions.size();
+
+    // What each definition computed, kept per definition so that functions
+    // sharing a name can be combined into one table entry.
+    std::vector<FunctionSummary> own(functions.size());
+    std::map<std::string, std::vector<std::size_t>> definitions;
+    for (const auto& [index, function] : std::views::enumerate(functions)) {
+        own[static_cast<std::size_t>(index)].name = function.name;
+        definitions[function.name].push_back(static_cast<std::size_t>(index));
+    }
+
+    // A logical clock. A function is stale when something it calls changed
+    // after the function itself was last computed.
+    std::uint64_t clock = 0;
+    std::vector<std::uint64_t> computed_at(functions.size(), 0);
+    std::map<std::string, std::uint64_t, std::less<>> changed_at;
+
     for (int iteration = 1; iteration <= max_iterations; ++iteration) {
         bool changed = false;
 
-        for (const auto& function : functions) {
+        for (const std::size_t index : order) {
+            const FunctionInfo& function = functions[index];
+
+            if (iteration > 1 && have_dependencies) {
+                const bool stale =
+                    std::ranges::any_of(plan.callees[index], [&](const std::string& callee) {
+                        const auto it = changed_at.find(callee);
+                        return it != changed_at.end() && it->second > computed_at[index];
+                    });
+                if (!stale) continue;
+            }
+
+            computed_at[index] = ++clock;
+
             FunctionSummary computed = compute(function, table);
             computed.name = function.name;
             computed.parameter_count = function.parameters.size();
             computed.iterations_to_settle = iteration;
+            if (own[index].equivalent_to(computed)) continue;
+            own[index] = std::move(computed);
 
-            const FunctionSummary* previous = table.find(function.name);
-            if (previous == nullptr || !previous->equivalent_to(computed)) {
-                table.set(function.name, std::move(computed));
-                changed = true;
+            // The table entry for a name is everything any definition of that
+            // name does.
+            FunctionSummary entry = own[index];
+            for (const std::size_t other : definitions[function.name]) {
+                if (other != index) entry.absorb(own[other]);
             }
+            table.set(function.name, std::move(entry));
+
+            changed_at[function.name] = ++clock;
+            changed = true;
         }
 
         if (!changed) break;
@@ -235,10 +294,7 @@ std::vector<FunctionInfo> collect_functions(const std::string& source, TSNode ro
 
     ast::walk(root, [&](TSNode node) {
         const std::string_view type = ast::node_type(node);
-        if (std::find(definition_node_types.begin(), definition_node_types.end(), type) ==
-            definition_node_types.end()) {
-            return;
-        }
+        if (!std::ranges::contains(definition_node_types, type)) return;
 
         FunctionInfo info;
         info.node = node;
