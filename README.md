@@ -101,9 +101,15 @@ are vendored and built by the Makefile. If `worker/third_party/` is empty:
 cd worker/third_party && for r in tree-sitter tree-sitter-javascript tree-sitter-python tree-sitter-go; do git clone --depth 1 https://github.com/tree-sitter/$r.git $r; done
 ```
 
-Python dependencies live in `ai-layer/venv` (`fastapi`, `uvicorn`,
-`psycopg2-binary`, `pgvector`, `sqlalchemy`, `numpy`, `pika`). The gateway
-needs Go 1.22 or later; the frontend needs Node 20 and pnpm.
+Python dependencies for the triage layer and the helper scripts are pinned in
+`ai-layer/requirements.txt` and installed into `ai-layer/venv`, which every
+command below expects:
+
+```bash
+cd ai-layer && python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+```
+
+The gateway needs Go 1.22 or later; the frontend needs Node 20 and pnpm.
 
 ## Running
 
