@@ -6,6 +6,10 @@
 
 const GATEWAY_URL = (process.env.GATEWAY_URL ?? "http://localhost:3001").replace(/\/+$/, "");
 
+// Sent as a bearer token when the gateway has GATEWAY_API_TOKEN set. Like the
+// URL, it is read on the server and never reaches the browser.
+const GATEWAY_API_TOKEN = process.env.GATEWAY_API_TOKEN ?? "";
+
 export type Verdict = "ESCALATED" | "SUPPRESSED" | "UNTRIAGED";
 export type ScanStatus = "PENDING" | "COMPLETED" | "FAILED";
 export type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO";
@@ -79,6 +83,7 @@ async function get<T>(path: string): Promise<Result<T>> {
     response = await fetch(`${GATEWAY_URL}${path}`, {
       // Scan state changes from one second to the next; never serve it stale.
       cache: "no-store",
+      headers: GATEWAY_API_TOKEN ? { Authorization: `Bearer ${GATEWAY_API_TOKEN}` } : undefined,
       signal: AbortSignal.timeout(5000),
     });
   } catch {
@@ -86,6 +91,14 @@ async function get<T>(path: string): Promise<Result<T>> {
       ok: false,
       status: 0,
       error: `Could not reach the gateway at ${GATEWAY_URL}.`,
+    };
+  }
+
+  if (response.status === 401) {
+    return {
+      ok: false,
+      status: 401,
+      error: "The gateway refused the frontend's token. Set GATEWAY_API_TOKEN to the gateway's value.",
     };
   }
 

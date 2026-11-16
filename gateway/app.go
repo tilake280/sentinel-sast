@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"log"
+	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 )
 
 // Deps is everything the HTTP layer depends on. main wires the real
@@ -17,6 +23,11 @@ type Deps struct {
 
 	Secret    string // GITHUB_WEBHOOK_SECRET
 	ScanQueue string
+
+	// APIToken, when set, is required as a bearer token on the read endpoints
+	// (scans, stats). Empty leaves them open, which is only appropriate when
+	// the gateway is reachable from nothing but the frontend.
+	APIToken string
 
 	// Dispatch runs work that continues after the webhook has been answered.
 	// Nil means a goroutine. Tests run it inline so they can assert on the
@@ -39,7 +50,14 @@ func NewApp(deps Deps, middleware ...fiber.Handler) *fiber.App {
 		// A push payload lists every changed path; the default 4 MiB is ample,
 		// stated here so the limit is a decision rather than an accident.
 		BodyLimit: 4 << 20,
+		// Without these a client that opens a connection and never finishes
+		// its request holds it open indefinitely.
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	})
+	// A panic in one handler answers 500 instead of ending the process.
+	app.Use(recover.New())
 	for _, handler := range middleware {
 		app.Use(handler)
 	}
@@ -53,7 +71,26 @@ func NewApp(deps Deps, middleware ...fiber.Handler) *fiber.App {
 		})
 	})
 
+	// Liveness says the process is up; readiness says it can do its job. An
+	// orchestrator restarts on the first and routes traffic on the second.
+	api.Get("/ready", func(c *fiber.Ctx) error {
+		ctx, cancel := context.WithTimeout(c.UserContext(), 3*time.Second)
+		defer cancel()
+		if err := deps.Store.Ping(ctx); err != nil {
+			log.Printf("readiness: store: %v", err)
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"status": "unavailable",
+				"store":  "unreachable",
+			})
+		}
+		return c.JSON(fiber.Map{"status": "ready", "store": "ok"})
+	})
+
 	api.Post("/webhook", deps.handleWebhook)
+
+	// Everything registered below is the read API, and is what the token
+	// guards. The webhook authenticates by signature instead.
+	api.Use(deps.requireToken)
 
 	api.Get("/scans", func(c *fiber.Ctx) error {
 		limit := c.QueryInt("limit", 50)
@@ -87,6 +124,24 @@ func NewApp(deps Deps, middleware ...fiber.Handler) *fiber.App {
 	})
 
 	return app
+}
+
+// requireToken enforces APIToken on the routes registered after it.
+func (d Deps) requireToken(c *fiber.Ctx) error {
+	if d.APIToken == "" {
+		return c.Next()
+	}
+	given, found := strings.CutPrefix(c.Get(fiber.HeaderAuthorization), "Bearer ")
+	// Hash both sides so the comparison is constant-time regardless of length.
+	want := sha256.Sum256([]byte(d.APIToken))
+	got := sha256.Sum256([]byte(given))
+	if !found || subtle.ConstantTimeCompare(want[:], got[:]) != 1 {
+		c.Set(fiber.HeaderWWWAuthenticate, "Bearer")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "missing or invalid bearer token",
+		})
+	}
+	return c.Next()
 }
 
 // storeError logs the cause and returns a generic 500: a database error
