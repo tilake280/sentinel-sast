@@ -796,26 +796,38 @@ int run_worker(const Options& options) {
             return 2;
         }
 
-        if (amqp_socket_open(socket, host.c_str(), port) != AMQP_STATUS_OK) {
-            std::cerr << std::format("[worker] cannot reach RabbitMQ at {}:{}; retrying in {}s\n",
-                                     host, port, reconnect_delay);
-            amqp_destroy_connection(conn);
-
-            // Sleep in short slices so a shutdown signal is not ignored for the
-            // whole backoff window.
+        // Sleeps out the current backoff and doubles it. In short slices, so a
+        // shutdown signal is not ignored for the whole window.
+        const auto back_off = [&reconnect_delay]() {
             for (int slept = 0; slept < reconnect_delay && !g_shutdown_requested.load();
                  ++slept) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
             reconnect_delay = std::min(reconnect_delay * 2, 30);
+        };
+
+        if (amqp_socket_open(socket, host.c_str(), port) != AMQP_STATUS_OK) {
+            std::cerr << std::format("[worker] cannot reach RabbitMQ at {}:{}; retrying in {}s\n",
+                                     host, port, reconnect_delay);
+            amqp_destroy_connection(conn);
+            back_off();
             continue;
         }
 
-        if (!check_reply(amqp_login(conn, "/", 0, AMQP_DEFAULT_FRAME_SIZE, 0,
-                                    AMQP_SASL_METHOD_PLAIN, user.c_str(), password.c_str()),
-                         "login")) {
+        const amqp_rpc_reply_t login =
+            amqp_login(conn, "/", 0, AMQP_DEFAULT_FRAME_SIZE, 0, AMQP_SASL_METHOD_PLAIN,
+                       user.c_str(), password.c_str());
+        if (!check_reply(login, "login")) {
             amqp_destroy_connection(conn);
-            return 2;  // bad credentials will not fix themselves
+            // The broker answering "no" is final: bad credentials will not fix
+            // themselves. Anything else is the connection dying mid-handshake,
+            // which is what a broker that is still starting looks like -- its
+            // port accepts connections before it can serve them.
+            if (login.reply_type == AMQP_RESPONSE_SERVER_EXCEPTION) return 2;
+            std::cerr << std::format("[worker] RabbitMQ at {}:{} is not ready; retrying in {}s\n",
+                                     host, port, reconnect_delay);
+            back_off();
+            continue;
         }
 
         amqp_channel_open(conn, 1);
