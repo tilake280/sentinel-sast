@@ -65,6 +65,29 @@ func (m *memoryStore) FailScan(_ context.Context, id, reason string) error {
 	return nil
 }
 
+func (m *memoryStore) FailStaleScans(_ context.Context, olderThan time.Duration, reason string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	failed := 0
+	for id, scan := range m.scans {
+		if scan.Status == StatusPending && time.Since(scan.CreatedAt) > olderThan {
+			scan.Status, scan.Error = StatusFailed, reason
+			m.scans[id] = scan
+			failed++
+		}
+	}
+	return failed, nil
+}
+
+func (m *memoryStore) Ping(_ context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failOn == "Ping" {
+		return errStoreDown
+	}
+	return nil
+}
+
 func (m *memoryStore) SaveResult(_ context.Context, result ScanResult) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -288,6 +311,136 @@ func TestHealthEndpoint(t *testing.T) {
 	want := `{"message":"Sentinel API Gateway is running","status":"online"}`
 	if got.raw != want {
 		t.Errorf("body = %s, want %s", got.raw, want)
+	}
+}
+
+func TestReadyReflectsTheStore(t *testing.T) {
+	h := newHarness(testSecret)
+	if got := h.get(t, "/api/v1/ready"); got.status != 200 {
+		t.Fatalf("status = %d, want 200", got.status)
+	}
+
+	h.store.failOn = "Ping"
+	got := h.get(t, "/api/v1/ready")
+	if got.status != 503 {
+		t.Fatalf("status with the store down = %d, want 503", got.status)
+	}
+	if strings.Contains(got.raw, errStoreDown.Error()) {
+		t.Errorf("readiness leaked the store error: %s", got.raw)
+	}
+	// Liveness must not depend on the store: a database outage is not a
+	// reason to restart the gateway.
+	if got := h.get(t, "/api/v1/health"); got.status != 200 {
+		t.Errorf("health with the store down = %d, want 200", got.status)
+	}
+}
+
+// ---- Read API token --------------------------------------------------------
+
+func TestReadAPIRequiresTheTokenWhenOneIsSet(t *testing.T) {
+	h := newHarness(testSecret)
+	h.app = NewApp(Deps{Store: h.store, Publisher: h.publisher, Fetcher: h.fetcher,
+		Secret: testSecret, ScanQueue: "scan_jobs", APIToken: "s3cret-token",
+		Dispatch: func(work func()) { work() }})
+
+	with := func(path, authorization string) int {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
+		}
+		return h.do(t, req).status
+	}
+
+	for _, path := range []string{"/api/v1/scans", "/api/v1/scans/nope", "/api/v1/stats"} {
+		if got := with(path, ""); got != 401 {
+			t.Errorf("%s without a token = %d, want 401", path, got)
+		}
+		if got := with(path, "Bearer wrong"); got != 401 {
+			t.Errorf("%s with the wrong token = %d, want 401", path, got)
+		}
+		if got := with(path, "s3cret-token"); got != 401 {
+			t.Errorf("%s with a token but no Bearer scheme = %d, want 401", path, got)
+		}
+	}
+	if got := with("/api/v1/scans", "Bearer s3cret-token"); got != 200 {
+		t.Errorf("scans with the token = %d, want 200", got)
+	}
+	if got := with("/api/v1/stats", "Bearer s3cret-token"); got != 200 {
+		t.Errorf("stats with the token = %d, want 200", got)
+	}
+
+	// Probes and the webhook do not use the token: probes carry no
+	// credentials, and the webhook is authenticated by its signature.
+	if got := with("/api/v1/health", ""); got != 200 {
+		t.Errorf("health without a token = %d, want 200", got)
+	}
+	if got := with("/api/v1/ready", ""); got != 200 {
+		t.Errorf("ready without a token = %d, want 200", got)
+	}
+	if got := h.webhook(t, "ping", "d-1", []byte(`{}`), sign(testSecret, []byte(`{}`))); got.status != 200 {
+		t.Errorf("signed ping without a token = %d, want 200", got.status)
+	}
+}
+
+// ---- Stale scans -----------------------------------------------------------
+
+func TestStaleScansAreFailedAndALateResultStillWins(t *testing.T) {
+	ctx := context.Background()
+	store := newMemoryStore()
+	store.CreateScan(ctx, Scan{ID: "old", Repository: "acme/web"})
+	store.CreateScan(ctx, Scan{ID: "new", Repository: "acme/web"})
+	old := store.scans["old"]
+	old.CreatedAt = time.Now().Add(-2 * time.Hour)
+	store.scans["old"] = old
+
+	failed, err := store.FailStaleScans(ctx, time.Hour, "no result arrived within 1h0m0s")
+	if err != nil || failed != 1 {
+		t.Fatalf("FailStaleScans = %d, %v; want 1, nil", failed, err)
+	}
+	if got := store.scans["old"]; got.Status != StatusFailed || got.Error == "" {
+		t.Errorf("old scan = %s %q, want FAILED with a reason", got.Status, got.Error)
+	}
+	if got := store.scans["new"]; got.Status != StatusPending {
+		t.Errorf("recent scan = %s, want PENDING", got.Status)
+	}
+
+	if err := handleResult(ctx, store, []byte(`{"job_id":"old","status":"COMPLETED"}`)); err != nil {
+		t.Fatalf("late result: %v", err)
+	}
+	if got := store.scans["old"]; got.Status != StatusCompleted || got.Error != "" {
+		t.Errorf("after a late result = %s %q, want COMPLETED and no error", got.Status, got.Error)
+	}
+}
+
+func TestBackgroundWaitsForDispatchedWork(t *testing.T) {
+	tasks := newBackground(2)
+	var mu sync.Mutex
+	running, peak, done := 0, 0, 0
+	for i := 0; i < 8; i++ {
+		tasks.Dispatch(func() {
+			mu.Lock()
+			running++
+			if running > peak {
+				peak = running
+			}
+			mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			mu.Lock()
+			running--
+			done++
+			mu.Unlock()
+		})
+	}
+	tasks.Dispatch(func() { panic("one bad task") })
+
+	if !tasks.Wait(5 * time.Second) {
+		t.Fatal("Wait timed out")
+	}
+	if done != 8 {
+		t.Errorf("finished %d tasks, want 8", done)
+	}
+	if peak > 2 {
+		t.Errorf("ran %d tasks at once, want at most 2", peak)
 	}
 }
 

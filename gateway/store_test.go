@@ -183,4 +183,34 @@ func TestPostgresStore(t *testing.T) {
 		Scan(&orphaned); err != nil || orphaned != 0 {
 		t.Errorf("findings left after their scan was deleted: %d (%v)", orphaned, err)
 	}
+
+	// ---- Stale scans and Ping ---------------------------------------------
+	// The database is shared with whatever else is running locally, so the
+	// row is backdated far beyond any real scan and the threshold set to
+	// match: nothing but this run's row can be old enough.
+	stale, fresh := prefix+"stale", prefix+"fresh"
+	for _, scanID := range []string{stale, fresh} {
+		if _, err := store.CreateScan(ctx, Scan{ID: scanID, Repository: "acme/web"}); err != nil {
+			t.Fatalf("CreateScan: %v", err)
+		}
+	}
+	if _, err := store.pool.Exec(ctx,
+		`UPDATE scans SET created_at = '1980-01-01' WHERE id = $1`, stale); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	failed, err := store.FailStaleScans(ctx, 40*365*24*time.Hour, "no result arrived")
+	if err != nil || failed != 1 {
+		t.Errorf("FailStaleScans = %d, %v; want 1, nil", failed, err)
+	}
+	if got, _, _ := store.GetScan(ctx, stale); got.Status != StatusFailed ||
+		got.Error != "no result arrived" || got.CompletedAt == nil {
+		t.Errorf("stale scan = %+v", got)
+	}
+	if got, _, _ := store.GetScan(ctx, fresh); got.Status != StatusPending {
+		t.Errorf("fresh scan = %s, want PENDING", got.Status)
+	}
+
+	if err := store.Ping(ctx); err != nil {
+		t.Errorf("Ping: %v", err)
+	}
 }

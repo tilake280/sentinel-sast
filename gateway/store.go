@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,6 +29,15 @@ type Store interface {
 	// jobs published straight to the queue still show up. Saving the same
 	// result twice leaves one copy of the findings.
 	SaveResult(ctx context.Context, result ScanResult) error
+
+	// FailStaleScans marks FAILED every scan that has been PENDING for longer
+	// than olderThan, and reports how many. A job whose worker died, or whose
+	// result was lost, would otherwise sit pending forever. A result that does
+	// arrive late still wins: SaveResult overwrites the status.
+	FailStaleScans(ctx context.Context, olderThan time.Duration, reason string) (int, error)
+
+	// Ping reports whether the store can answer a query right now.
+	Ping(ctx context.Context) error
 
 	ListScans(ctx context.Context, limit int) ([]Scan, error)
 	GetScan(ctx context.Context, id string) (Scan, []Finding, error)
@@ -76,6 +86,7 @@ CREATE TABLE IF NOT EXISTS findings (
 );
 
 CREATE INDEX IF NOT EXISTS findings_scan_id_idx ON findings (scan_id);
+CREATE INDEX IF NOT EXISTS scans_created_at_idx ON scans (created_at DESC);
 `
 
 // PostgresStore is the Store backed by the project's Postgres.
@@ -120,6 +131,19 @@ func (s *PostgresStore) FailScan(ctx context.Context, id, reason string) error {
 		id, StatusFailed, reason)
 	return err
 }
+
+func (s *PostgresStore) FailStaleScans(ctx context.Context, olderThan time.Duration, reason string) (int, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE scans SET status = $1, error = $2, completed_at = now()
+		WHERE status = $3 AND created_at < now() - make_interval(secs => $4)`,
+		StatusFailed, reason, StatusPending, olderThan.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+func (s *PostgresStore) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 func (s *PostgresStore) SaveResult(ctx context.Context, result ScanResult) error {
 	status := StatusCompleted
